@@ -1,0 +1,23 @@
+# Merci Raymond — base theme tokens.
+# Heavy lifting (typography, custom components) is done via injected CSS in
+# lib/branding.py. These tokens give Streamlit's built-in widgets the right
+# colour palette before our CSS overrides kick in.
+
+[theme]
+base = "light"
+primaryColor = "#3A5A40"             # Sage / forest green — landscape vibe
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F5F2EC"  # Warm cream for sidebar / cards
+textColor = "#1A1A1A"
+font = "sans serif"
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"

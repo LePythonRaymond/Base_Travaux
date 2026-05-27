@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Source PDFs (may contain confidential supplier data)
+data/invoices/*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

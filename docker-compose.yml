@@ -1,0 +1,82 @@
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  streamlit:
+    build: ./streamlit_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      STREAMLIT_AUTH_USER: ${STREAMLIT_AUTH_USER}
+      STREAMLIT_AUTH_PASSWORD_HASH: ${STREAMLIT_AUTH_PASSWORD_HASH}
+      INVOICE_DIR: /data/invoices
+    volumes:
+      - ./data/invoices:/data/invoices
+      # Bind-mount the host's streamlit_app/ over /app so edits on the
+      # host are immediately reflected in the container — and survive
+      # `docker compose down` / `up`. Streamlit watches /app for file
+      # changes and hot-reloads. No more `docker cp` step.
+      - ./streamlit_app:/app
+    expose:
+      - "8501"
+
+  bordereau_api:
+    build: ./bordereau_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      BORDEREAU_API_KEY: ${BORDEREAU_API_KEY}
+    expose:
+      - "8000"
+    # Direct host port for plain-HTTP testing (Excel Power Query, curl).
+    # Caddy at :443 still proxies the same endpoint over HTTPS — both work.
+    # Auth is enforced inside FastAPI via X-API-Key, so opening this port is safe.
+    # Bound to 127.0.0.1 only (no LAN exposure). Host port 8765 to avoid conflicts.
+    ports:
+      - "127.0.0.1:8765:8000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN}
+      STREAMLIT_AUTH_USER: ${STREAMLIT_AUTH_USER}
+      STREAMLIT_AUTH_PASSWORD_HASH: ${STREAMLIT_AUTH_PASSWORD_HASH}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - streamlit
+      - bordereau_api
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

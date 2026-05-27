@@ -1,0 +1,37 @@
+# Merci Raymond Pricing DB — reverse proxy + HTTPS termination
+#
+# PUBLIC_DOMAIN env var controls which hostname this site listens on:
+#   - "localhost"           → Caddy issues a self-signed cert via its internal CA
+#                            (browsers will warn until the CA is trusted; fine
+#                            for local dev).
+#   - "prices.merciraymond.fr" (or any real DNS name)
+#                          → Caddy auto-provisions a Let's Encrypt cert.
+#
+# Two route groups:
+#   /api/*   → bordereau_api (FastAPI) — auth done inside FastAPI via X-API-Key header.
+#   else     → streamlit (admin UI) — basic auth at the proxy AND a Streamlit
+#              login page inside (belt and braces).
+
+{$PUBLIC_DOMAIN} {
+    encode gzip
+
+    # Public bordereau API (key check inside FastAPI, NOT here).
+    handle /api/* {
+        reverse_proxy bordereau_api:8000
+    }
+
+    # Everything else → Streamlit admin
+    handle {
+        basic_auth {
+            {env.STREAMLIT_AUTH_USER} {env.STREAMLIT_AUTH_PASSWORD_HASH}
+        }
+        reverse_proxy streamlit:8501 {
+            # Streamlit's UI runs over a websocket. Caddy 2 handles the
+            # Connection/Upgrade hop and X-Forwarded-* headers automatically;
+            # we only need to override Host so Streamlit sees the public name,
+            # plus an explicit X-Real-IP since Caddy doesn't set that one.
+            header_up Host {host}
+            header_up X-Real-IP {remote}
+        }
+    }
+}
