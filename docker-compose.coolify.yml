@@ -1,0 +1,107 @@
+# =============================================================================
+# Production deployment for Coolify (Hostinger VPS)
+# =============================================================================
+# Differences vs the local `docker-compose.yml`:
+#   - Caddy is REMOVED. Coolify's built-in Traefik proxy terminates TLS
+#     (Let's Encrypt), enforces HTTP basic-auth on the admin UI, and does the
+#     `/api/*` vs `/` path split — all via the Traefik labels below.
+#   - No host code bind-mount (`./streamlit_app:/app`): the built image is the
+#     artifact in production, not a live host mount.
+#   - Invoices live in a NAMED volume (Coolify-managed, persistent + backupable)
+#     instead of a host bind mount.
+#   - The bordereau_api host port mapping is removed; Traefik routes it.
+#
+# Coolify setup notes (see DEPLOY_COOLIFY.md for the full runbook):
+#   - Deploy as a "Docker Compose" resource pointing at THIS file.
+#   - Set every variable below in Coolify's Environment Variables UI — do NOT
+#     commit a real .env.
+#   - Leave each service's "Domains" field EMPTY in Coolify: routing is done
+#     entirely by the custom Traefik labels here.
+#   - Certresolver name is Coolify's default: "letsencrypt". If you changed it
+#     in your Coolify proxy config, update the tls.certresolver labels.
+# =============================================================================
+
+services:
+
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # init/*.sql run ONLY on first boot (empty volume). Schema + seed +
+      # taxonomy. After that, schema changes are hand-applied SQL.
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - traefik.enable=false   # internal only — never exposed
+
+  streamlit:
+    build: ./streamlit_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      STREAMLIT_AUTH_USER: ${STREAMLIT_AUTH_USER}
+      STREAMLIT_AUTH_PASSWORD_HASH: ${STREAMLIT_AUTH_PASSWORD_HASH}
+      INVOICE_DIR: /data/invoices
+    volumes:
+      - invoices_data:/data/invoices
+    expose:
+      - "8501"
+    labels:
+      - traefik.enable=true
+      # --- Admin UI: catch-all on the domain, behind basic-auth (priority 10) ---
+      - "traefik.http.routers.mr-app.rule=Host(`${PUBLIC_DOMAIN}`)"
+      - traefik.http.routers.mr-app.entryPoints=https
+      - traefik.http.routers.mr-app.tls=true
+      - traefik.http.routers.mr-app.tls.certresolver=letsencrypt
+      - traefik.http.routers.mr-app.priority=10
+      - traefik.http.routers.mr-app.service=mr-app
+      # Explicit loadbalancer port — Coolify sometimes omits this for compose
+      # resources (coollabsio/coolify#6233), causing "no available server".
+      - traefik.http.services.mr-app.loadbalancer.server.port=8501
+      # Basic-auth middleware. user:bcrypt-hash interpolated from Coolify env.
+      # Env-substituted values are NOT re-parsed for `$`, so the bcrypt hash
+      # passes through intact. If Coolify mangles it, see DEPLOY_COOLIFY.md (Auth).
+      - "traefik.http.middlewares.mr-auth.basicauth.users=${STREAMLIT_AUTH_USER}:${STREAMLIT_AUTH_PASSWORD_HASH}"
+      - traefik.http.routers.mr-app.middlewares=mr-auth
+
+  bordereau_api:
+    build: ./bordereau_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      BORDEREAU_API_KEY: ${BORDEREAU_API_KEY}
+    expose:
+      - "8000"
+    labels:
+      - traefik.enable=true
+      # --- Public API: /api/* on the same domain, NO basic-auth (priority 100) ---
+      # Auth is enforced INSIDE FastAPI via the X-API-Key header / ?key=, so the
+      # proxy must NOT add basic-auth here (Power Query / IMPORTDATA need a clean
+      # response). Higher priority so /api beats the catch-all admin router.
+      - "traefik.http.routers.mr-api.rule=Host(`${PUBLIC_DOMAIN}`) && PathPrefix(`/api`)"
+      - traefik.http.routers.mr-api.entryPoints=https
+      - traefik.http.routers.mr-api.tls=true
+      - traefik.http.routers.mr-api.tls.certresolver=letsencrypt
+      - traefik.http.routers.mr-api.priority=100
+      - traefik.http.routers.mr-api.service=mr-api
+      - traefik.http.services.mr-api.loadbalancer.server.port=8000
+
+volumes:
+  postgres_data:
+  invoices_data:
