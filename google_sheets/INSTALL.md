@@ -80,9 +80,16 @@ duplicating that master — the Apps Script comes along for the ride.
    clicks accept. **Once per project copy.**
 4. Renames the file to the project name (e.g. `DPGF Pavillons Quai
    Austerlitz 2026-05`).
-5. Pastes the customer's DPGF into the LEFT zone (columns A-Z). Sets the
-   three column mappings on the **Paramètres** tab.
-6. Works the cascade picker row by row.
+5. Runs **🌿 Merci Raymond → 📊 Installer / MAJ rentabilité** once (rebinds the
+   workbook-scoped named ranges used by the cost chain + the rentability recap,
+   which don't survive *Faire une copie*).
+6. Pastes the customer's DPGF into the LEFT zone (columns A-Z). Sets the
+   three column mappings on the **Pilotage de rentabilité** tab (the renamed
+   *Paramètres* tab — `Col_Designation` / `Col_Unite` / `Col_Quantite` in B16-B18).
+7. Works the cascade picker row by row, ticking **`SST ?`** (col BD) on any
+   subcontractor line. The recap block on the **Pilotage de rentabilité** tab
+   (Prix vente / revient / Marge / KV, GLOBAL + Hors-SST + Tps chantier) updates
+   live as he prices.
 
 ## Updating the master script later
 

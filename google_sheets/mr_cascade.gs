@@ -32,6 +32,21 @@ const COL_AD = 30;  // Famille
 const COL_AE = 31;  // Sous-catégorie
 const COL_AF = 32;  // Conditionnement
 const COL_AG = 33;  // Produit
+// COL_BE (57) = hidden stable product-id column. It's a passive lookup
+// formula (=INDEX(Bordereau!A.., MATCH(AG.., Helpers!A.., 0))) the cascade
+// doesn't touch — see google_sheets/CELL_FORMULAS.md §3. Reverse-ingestion
+// reads it to match a line to its DB product exactly.
+const COL_BE = 57;  // hidden product DB id (resolved from the picker)
+const COL_SST = 56; // BD — "SST ?" tick-box: TRUE = sous-traitant line, excluded
+                    // from the Hors-SST rentability block on the Pilotage tab.
+const COL_COMMENT = 58; // BF — wide free-text "Commentaire" column (yellow input
+                        // colour) for per-line / per-section notes by Vincent.
+
+// The project-settings tab was renamed "Paramètres" → "Pilotage de rentabilité"
+// (it now hosts coefficients + the rentability recap). _getParamsSheet_() below
+// renames an old-named tab in place so existing copies upgrade cleanly.
+const PARAMS_SHEET_OLD = 'Paramètres';
+const PARAMS_SHEET     = 'Pilotage de rentabilité';
 
 // Visible "no-filter" sentinel. Picking it is equivalent to leaving blank.
 const ALL = '— Tous —';
@@ -73,7 +88,7 @@ function onEdit(e) {
   if (row < DATA_FIRST_ROW) return;
 
   const col = e.range.getColumn();
-  if (col !== COL_AD && col !== COL_AE && col !== COL_AF) return;
+  if (col !== COL_AD && col !== COL_AE && col !== COL_AF && col !== COL_AG) return;
 
   // Cache reads for this invocation.
   const taxo = readTaxonomy_();
@@ -94,7 +109,123 @@ function onEdit(e) {
   } else if (col === COL_AF) {
     refreshProduitDropdown_(sheet, row, bord);
     sheet.getRange(row, COL_AG).clearContent();
+  } else if (col === COL_AG) {
+    // Reverse cascade — when the user picks (or pastes) a product directly
+    // in AG without going through AD/AE/AF, parse the picker string and
+    // back-fill the upstream cascade. Also re-refreshes the AG dropdown so
+    // the chosen value is officially in the validated list (kills the red
+    // "Non valide" triangle).
+    handleProduitDirectEdit_(sheet, row, bord, taxo);
   }
+}
+
+
+/**
+ * Reverse cascade: triggered when the user edits AG directly.
+ *
+ * The AG value is expected to be one of:
+ *   • a 4-part picker string `Famille — Sous-cat — Référence — Cond.`
+ *     (the canonical format the dropdown produces);
+ *   • a 3-part legacy `Famille — Référence — Cond.` (from older sheets);
+ *   • the Prix-moyen sentinel — nothing to back-fill;
+ *   • a free-text product name — we look it up in the Bordereau; if it
+ *     uniquely matches a single product, we back-fill from there;
+ *   • garbage — we leave the cascade as-is (warning triangle persists,
+ *     telling the user the input wasn't recognised).
+ *
+ * After back-fill, all three dropdowns and the AG dropdown are refreshed
+ * so the cascade is in a consistent state.
+ */
+function handleProduitDirectEdit_(sheet, row, bord, taxo) {
+  const raw = String(sheet.getRange(row, COL_AG).getValue() || '').trim();
+  if (!raw || raw === PRIX_MOYEN) return;
+
+  let famille = null, sousCat = null, ref = null, packaging = null;
+
+  // 1. Try the 4-part picker format ("Famille — Sous-cat — Ref — Cond.").
+  const parts = raw.split(' — ').map(function (s) { return s.trim(); });
+  if (parts.length === 4) {
+    famille  = parts[0];
+    sousCat  = parts[1];
+    ref      = parts[2];
+    packaging = parts[3];
+  } else if (parts.length === 3) {
+    // Legacy 3-part picker — no sous-cat. Look up the Bordereau row to
+    // recover it.
+    famille  = parts[0];
+    ref      = parts[1];
+    packaging = parts[2];
+    var match = _findBordereauRow(bord, {
+      family_name: famille, reference_name: ref, packaging: packaging,
+    });
+    if (match) sousCat = match.subcategory;
+  } else {
+    // Free text — try to match exactly on reference_name (case-sensitive,
+    // exact). Multiple matches ⇒ ambiguous, give up.
+    var matches = bord.filter(function (r) { return r.reference_name === raw; });
+    if (matches.length === 1) {
+      famille  = matches[0].family_name;
+      sousCat  = matches[0].subcategory;
+      ref      = matches[0].reference_name;
+      packaging = matches[0].packaging;
+      // Rewrite the AG cell with the canonical picker string so AI/AJ
+      // formulas (which match against Helpers!A) resolve correctly.
+      var canonical = famille + ' — ' + sousCat + ' — ' + ref + ' — ' + packaging;
+      sheet.getRange(row, COL_AG).setValue(canonical);
+    } else {
+      // Couldn't recognise — leave cascade as-is.
+      return;
+    }
+  }
+
+  // 2. Verify the triplet exists in the Bordereau, otherwise the AI/AJ
+  // formulas won't find it and the back-fill would be misleading.
+  if (!famille || !sousCat || !ref || !packaging) return;
+  var bordMatch = _findBordereauRow(bord, {
+    family_name: famille,
+    subcategory: sousCat,
+    reference_name: ref,
+    packaging: packaging,
+  });
+  if (!bordMatch) {
+    // The product on this picker string isn't in our DB. Leave the
+    // cascade as-is and let the warning triangle stay — that's the right
+    // signal to Vincent that the product isn't (yet) in the catalogue.
+    return;
+  }
+
+  // 3. Back-fill the cascade cells WITHOUT triggering onEdit (the
+  // recursion would clear AG again right after we set it). Apps Script
+  // setValue inside onEdit doesn't re-fire onEdit on simple triggers, so
+  // this is safe.
+  sheet.getRange(row, COL_AD).setValue(famille);
+  sheet.getRange(row, COL_AE).setValue(sousCat);
+  sheet.getRange(row, COL_AF).setValue(packaging);
+
+  // 4. Rebuild every dropdown for the row so AE/AF/AG are populated with
+  // the correct option lists (and AG now includes our chosen value, so
+  // the red "Non valide" triangle disappears).
+  refreshSousCatDropdown_(sheet, row, taxo);
+  refreshCondDropdown_(sheet, row, taxo);
+  refreshProduitDropdown_(sheet, row, bord);
+}
+
+
+/**
+ * Find the first Bordereau row matching every provided key (exact text
+ * comparison). Returns null if no row matches. Keys whose value is
+ * undefined or null are skipped.
+ */
+function _findBordereauRow(bord, criteria) {
+  for (var i = 0; i < bord.length; i++) {
+    var row = bord[i];
+    var hit = true;
+    for (var k in criteria) {
+      if (criteria[k] != null && row[k] !== criteria[k]) { hit = false; break; }
+    }
+    if (hit) return row;
+  }
+  return null;
 }
 
 
@@ -197,9 +328,15 @@ function applyListValidation_(target, values) {
     target.clearDataValidations();
     return;
   }
+  // `setAllowInvalid(true)` = show the list as a dropdown helper, but
+  // don't reject values typed/pasted in. Combined with the reverse
+  // cascade in handleProduitDirectEdit_(), the user can paste a picker
+  // string straight into AG and the upstream cells back-fill on the
+  // next onEdit tick — no more "Non valide" red triangle for legitimate
+  // products that simply weren't reachable via the current cascade.
   const rule = SpreadsheetApp.newDataValidation()
                  .requireValueInList(values, true)
-                 .setAllowInvalid(false)
+                 .setAllowInvalid(true)
                  .build();
   target.setDataValidation(rule);
 }
@@ -253,9 +390,9 @@ function applyV24Patch() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const dpgf = ss.getSheetByName(DPGF_SHEET);
   const helpers = ss.getSheetByName('Helpers');
-  const params = ss.getSheetByName('Paramètres');
+  const params = _getParamsSheet_(ss);   // renames "Paramètres" → "Pilotage de rentabilité" if needed
   if (!dpgf || !helpers || !params) {
-    SpreadsheetApp.getUi().alert('DPGF, Helpers ou Paramètres introuvable. Avorté.');
+    SpreadsheetApp.getUi().alert('DPGF, Helpers ou Pilotage de rentabilité introuvable. Avorté.');
     return;
   }
 
@@ -416,7 +553,214 @@ function applyV24Patch() {
   // computed for me" is obvious.
   _rebuildConditionalFormatting_(dpgf, FIRST, LAST);
 
-  SpreadsheetApp.getActive().toast('Patch v2.4 appliqué — Helpers + DPGF + miroir + couleurs mis à jour.', 'OK', 6);
+  // --- 5. Rentability recap + SST/BE columns -----------------------
+  // Installs the "Pilotage de rentabilité" recap block, the SST tick-box
+  // column (BD) and the hidden product-id column (BE). Idempotent.
+  applyRentabilite();
+
+  SpreadsheetApp.getActive().toast('Patch v2.4 appliqué — Helpers + DPGF + miroir + couleurs + rentabilité.', 'OK', 6);
+}
+
+
+/**
+ * Return the project-settings tab. Prefers the new name; if only the legacy
+ * "Paramètres" tab exists, renames it in place (setName keeps the gridId, so
+ * cell content + named-range targets survive). Idempotent.
+ */
+function _getParamsSheet_(ss) {
+  var s = ss.getSheetByName(PARAMS_SHEET);
+  if (s) return s;
+  var old = ss.getSheetByName(PARAMS_SHEET_OLD);
+  if (old) { old.setName(PARAMS_SHEET); return old; }
+  return null;
+}
+
+
+/**
+ * Set a human label (col A) + machine identifier (col C, hidden) and, only if
+ * the value cell (col B) is empty, a default value. Used for the rentability
+ * INPUT cells so a re-run never clobbers Vincent's tuned Personnes / heures.
+ */
+function _setIfBlank_(sh, row, ident, defVal, label) {
+  sh.getRange(row, 1).setValue(label);
+  sh.getRange(row, 3).setValue(ident);
+  var c = sh.getRange(row, 2);
+  var v = c.getValue();
+  if (v === '' || v === null) c.setValue(defVal);
+}
+
+
+/**
+ * Install / refresh the rentability recap on the "Pilotage de rentabilité" tab
+ * (GLOBAL + Hors-SST financials + the Tps-chantier planning line), plus the
+ * SST tick-box column (BD) and the hidden product-id column (BE) on the DPGF
+ * tab. Idempotent — run once on the MASTER; "Faire une copie" inherits the
+ * cells, and Vincent re-runs the menu item once per copy to rebind the
+ * workbook-scoped named ranges (same as the v2.4 patch).
+ */
+function applyRentabilite() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dpgf = ss.getSheetByName(DPGF_SHEET);
+  const params = _getParamsSheet_(ss);
+  if (!dpgf || !params) {
+    SpreadsheetApp.getUi().alert('DPGF ou Pilotage de rentabilité introuvable. Avorté.');
+    return;
+  }
+  const FIRST = 3, LAST = 502;
+  const YELLOW = '#FFF2CC';   // "Vincent writes here" input colour
+  const GREEN  = '#1F5132';   // section-header band (brand green)
+  const ACCENT = '#2E7D52';   // KV / marge accent
+  const INK    = '#1A1A1A';
+
+  // --- A. SST tick-box column (BD) on the DPGF tab -----------------
+  dpgf.getRange(2, COL_SST).setValue('SST ?');
+  dpgf.getRange(FIRST, COL_SST, LAST - FIRST + 1, 1)
+      .setDataValidation(SpreadsheetApp.newDataValidation().requireCheckbox().build());
+
+  // --- B. Hidden product-id column (BE) on the DPGF tab ------------
+  dpgf.getRange(2, COL_BE).setValue('product_id');
+  const beFormulas = [];
+  for (let r = FIRST; r <= LAST; r++) {
+    beFormulas.push([_formulaForLocale(
+      '=IFERROR(INDEX(Bordereau!$A$2:$A$501, MATCH(AG' + r + ', Helpers!$A$2:$A$501, 0)), "")'
+    )]);
+  }
+  dpgf.getRange(FIRST, COL_BE, LAST - FIRST + 1, 1).setFormulas(beFormulas);
+  dpgf.hideColumns(COL_BE);
+
+  // --- B2. Wide free-text "Commentaire" column (BF) ---------------
+  // Open notes per line / section, in the yellow input colour so it reads
+  // as "write here". Last visible column on the DPGF tab.
+  dpgf.getRange(2, COL_COMMENT)
+      .setValue('Commentaire')
+      .setFontWeight('bold');
+  dpgf.setColumnWidth(COL_COMMENT, 340);
+  const commentRange = dpgf.getRange(FIRST, COL_COMMENT, LAST - FIRST + 1, 1);
+  // Force a plain text column: strip ANY pre-existing data validation
+  // (e.g. a stray checkbox rule) and clear leftover TRUE/FALSE values so the
+  // cells are genuinely free-text, not tick-boxes.
+  commentRange.clearDataValidations();
+  commentRange.setNumberFormat('@');   // plain text
+  const commentVals = commentRange.getValues();
+  for (let i = 0; i < commentVals.length; i++) {
+    var cv = commentVals[i][0];
+    if (cv === true || cv === false) commentVals[i][0] = '';
+  }
+  commentRange.setValues(commentVals);
+  commentRange
+      .setBackground(YELLOW)
+      .setWrap(true)
+      .setVerticalAlignment('top')
+      .setHorizontalAlignment('left')
+      .setBorder(true, true, true, true, false, false, '#E6D9A8', SpreadsheetApp.BorderStyle.SOLID);
+
+  // --- C. Recap layout — LABEL (A) · VALUE (B) · id (C, hidden) ----
+  // INPUT cells (value set only if blank — preserve Vincent's tuning).
+  _setIfBlank_(params, 22, 'Personnes',         5,    'Personnes (équipe)');
+  _setIfBlank_(params, 23, 'Heures_par_jour',   7,    'Heures / jour');
+  _setIfBlank_(params, 24, 'Jours_par_semaine', 5,    'Jours / semaine');
+  _setIfBlank_(params, 25, 'Semaines_par_mois', 4.48, 'Semaines / mois');
+
+  // Label (A) + identifier (C, hidden) for every recap row — always rewrite.
+  const LBLID = [
+    [21, 'Tps chantier (h)',            'Tps_chantier'],
+    [26, 'Jours',                       'Jours'],
+    [27, 'Semaines',                    'Semaines'],
+    [28, 'Mois',                        'Mois'],
+    [31, 'Prix de vente',               'Rent_prix_vente'],
+    [32, 'Prix de revient',             'Rent_prix_revient'],
+    [33, 'Marge €',                     'Rent_marge_eur'],
+    [34, 'Marge %',                     'Rent_marge_pct'],
+    [35, 'KV (vente / revient)',        'Rent_kv'],
+    [38, 'Prix de vente',               'Rent_hs_prix_vente'],
+    [39, 'Prix de revient',             'Rent_hs_prix_revient'],
+    [40, 'Marge €',                     'Rent_hs_marge_eur'],
+    [41, 'Marge %',                     'Rent_hs_marge_pct'],
+    [42, 'KV (vente / revient)',        'Rent_hs_kv'],
+  ];
+  LBLID.forEach(function(t) {
+    params.getRange(t[0], 1).setValue(t[1]).setFontColor('#3A3A3A').setFontWeight('normal');
+    params.getRange(t[0], 3).setValue(t[2]);
+  });
+
+  // --- D. Recap formulas (always rewrite, locale-safe) ------------
+  const FORMULAS = [
+    // IFERROR wrap: empty rows return "" in AK/AL/AM/AC, which would make a
+    // bare SUMPRODUCT throw #VALUE!; element-wise IFERROR coerces them to 0.
+    [21, '=SUMPRODUCT(IFERROR((DPGF!AK3:AK502+DPGF!AL3:AL502)*DPGF!AM3:AM502*DPGF!AC3:AC502, 0))'],
+    [26, '=IF(Personnes*Heures_par_jour=0,"",Tps_chantier/(Personnes*Heures_par_jour))'],
+    [27, '=IF(Jours_par_semaine=0,"",Jours/Jours_par_semaine)'],
+    [28, '=IF(Semaines_par_mois=0,"",Semaines/Semaines_par_mois)'],
+    [31, '=SUM(DPGF!BB3:BB502)'],
+    [32, '=SUM(DPGF!AT3:AT502)+SUM(DPGF!AU3:AU502)+SUM(DPGF!AV3:AV502)+SUM(DPGF!AW3:AW502)+SUM(DPGF!AX3:AX502)'],
+    [33, '=Rent_prix_vente-Rent_prix_revient'],
+    [34, '=IF(Rent_prix_vente=0,"",Rent_marge_eur/Rent_prix_vente*100)'],
+    [35, '=IF(Rent_prix_revient=0,"",Rent_prix_vente/Rent_prix_revient)'],
+    [38, '=SUMIFS(DPGF!BB3:BB502, DPGF!BD3:BD502, FALSE)'],
+    [39, '=SUMIFS(DPGF!AT3:AT502, DPGF!BD3:BD502, FALSE)+SUMIFS(DPGF!AU3:AU502, DPGF!BD3:BD502, FALSE)+SUMIFS(DPGF!AV3:AV502, DPGF!BD3:BD502, FALSE)+SUMIFS(DPGF!AW3:AW502, DPGF!BD3:BD502, FALSE)+SUMIFS(DPGF!AX3:AX502, DPGF!BD3:BD502, FALSE)'],
+    [40, '=Rent_hs_prix_vente-Rent_hs_prix_revient'],
+    [41, '=IF(Rent_hs_prix_vente=0,"",Rent_hs_marge_eur/Rent_hs_prix_vente*100)'],
+    [42, '=IF(Rent_hs_prix_revient=0,"",Rent_hs_prix_vente/Rent_hs_prix_revient)'],
+  ];
+  FORMULAS.forEach(function(t) {
+    params.getRange(t[0], 2).setFormula(_formulaForLocale(t[1]));
+  });
+
+  // --- E. Value styling + number formats --------------------------
+  // All values bold + right-aligned in col B.
+  params.getRange('B21:B42').setFontWeight('bold').setHorizontalAlignment('right').setFontColor(INK);
+  // Money / % / KV formats.
+  params.getRange('B31:B33').setNumberFormat('# ##0,00 €');
+  params.getRange('B38:B40').setNumberFormat('# ##0,00 €');
+  params.getRange('B34').setNumberFormat('0,00"%"');
+  params.getRange('B41').setNumberFormat('0,00"%"');
+  params.getRange('B35').setNumberFormat('0,000');
+  params.getRange('B42').setNumberFormat('0,000');
+  params.getRange('B21').setNumberFormat('0');
+  params.getRange('B26').setNumberFormat('0');
+  params.getRange('B27:B28').setNumberFormat('0,0');
+  // Accent the KV + marge figures.
+  params.getRangeList(['B33', 'B34', 'B40', 'B41']).setFontColor(ACCENT);
+  params.getRangeList(['B35', 'B42']).setFontColor(ACCENT).setFontSize(12);
+  // INPUT cells: yellow + border so they read as editable.
+  params.getRange('B22:B25')
+        .setBackground(YELLOW).setFontWeight('normal').setFontColor(INK)
+        .setBorder(true, true, true, true, true, true, '#E6D9A8', SpreadsheetApp.BorderStyle.SOLID);
+  // Card outline + column widths + hide the identifier column.
+  params.getRange('A20:B42').setBorder(true, true, true, true, false, false, '#D9D9D9', SpreadsheetApp.BorderStyle.SOLID);
+  params.setColumnWidth(1, 210);
+  params.setColumnWidth(2, 150);
+  params.hideColumns(3);
+
+  // Section header bands — applied LAST so white-on-green wins over the
+  // col-B value styling that overlaps the merged header cells (B30/B37).
+  [[20, 'TEMPS CHANTIER'], [30, 'RENTABILITÉ — GLOBAL'], [37, 'RENTABILITÉ — HORS SST']]
+    .forEach(function(h) {
+      params.getRange(h[0], 3).setValue('');
+      params.getRange(h[0], 1, 1, 2).breakApart().merge()
+          .setValue(h[1])
+          .setBackground(GREEN).setFontColor('#FFFFFF').setFontWeight('bold')
+          .setFontSize(10).setHorizontalAlignment('left').setVerticalAlignment('middle');
+      params.setRowHeight(h[0], 24);
+    });
+
+  // --- F. Named ranges for the recap cells (workbook scope) -------
+  const RENT_NAMED = [
+    ['Tps_chantier','B21'], ['Personnes','B22'], ['Heures_par_jour','B23'],
+    ['Jours_par_semaine','B24'], ['Semaines_par_mois','B25'],
+    ['Jours','B26'], ['Semaines','B27'],
+    ['Rent_prix_vente','B31'], ['Rent_prix_revient','B32'], ['Rent_marge_eur','B33'],
+    ['Rent_hs_prix_vente','B38'], ['Rent_hs_prix_revient','B39'], ['Rent_hs_marge_eur','B40'],
+  ];
+  const want = {};
+  RENT_NAMED.forEach(function(p) { want[p[0]] = 1; });
+  ss.getNamedRanges().forEach(function(nr) {
+    var n = nr.getName(); var b = n.lastIndexOf('!'); if (b >= 0) n = n.substring(b + 1);
+    if (want[n]) nr.remove();
+  });
+  RENT_NAMED.forEach(function(p) { ss.setNamedRange(p[0], params.getRange(p[1])); });
+
+  SpreadsheetApp.getActive().toast('Bloc rentabilité installé sur « Pilotage de rentabilité ».', 'OK', 5);
 }
 
 

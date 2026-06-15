@@ -99,6 +99,61 @@ def _fmt_eur(v) -> str:
     return f"{float(v):,.2f} €".replace(",", " ")
 
 
+def _render_breakdown(bd: dict, date_str: str, project_name) -> str:
+    """Format a price_history.breakdown JSONB dict (the AK..BC cost+margin
+    columns + the project coefficient snapshot) into a compact HTML card that
+    explains how the client PU was built. Keys are best-effort: any absent
+    component is simply skipped."""
+    def _eur(key):
+        v = bd.get(key)
+        if not isinstance(v, (int, float)):
+            return None
+        return f"{float(v):,.2f} €".replace(",", " ")
+
+    def _coef(key):
+        c = (bd.get("coefficients") or {})
+        v = c.get(key)
+        return f"{float(v):g}" if isinstance(v, (int, float)) else None
+
+    def _line(label, value, *, strong=False, color="var(--hf-body)", op=""):
+        if value is None:
+            return ""
+        w = "600" if strong else "400"
+        op_html = (
+            f'<span style="color:var(--hf-muted);width:10px;display:inline-block">{op}</span>'
+            if op else '<span style="width:10px;display:inline-block"></span>'
+        )
+        return (
+            f'<div class="hf-row hf-between" style="font-size:10px;line-height:1.7;gap:8px">'
+            f'<span style="color:var(--hf-muted)">{op_html}{label}</span>'
+            f'<span style="font-weight:{w};color:{color};white-space:nowrap">{value}</span></div>'
+        )
+
+    proj = f" · {str(project_name)[:22]}" if project_name and not isinstance(project_name, float) else ""
+    parts = [
+        f'<div style="border:1px solid var(--hf-border-soft);border-radius:5px;'
+        f'padding:7px 9px;margin-bottom:7px;font-family:JetBrains Mono,monospace">'
+        f'<div class="hf-mono" style="font-size:9.5px;color:var(--hf-terra);margin-bottom:3px">'
+        f'{date_str}{proj}</div>',
+        _line("Coût M.O. / U", _eur("cout_mo_u")),
+        _line("Fourniture / U", _eur("fourniture_u")),
+        _line("Coût U fourni-posé", _eur("cout_u_fp"), strong=True),
+        _line("Location", _eur("location"), op="+"),
+        _line("Livraison", _eur("livraison"), op="+"),
+        _line("Installation chantier", _eur("install_chantier"), op="+"),
+        _line("Log. &amp; gestion", _eur("log_gestion"), op="+"),
+        _line("× Marge loc/livr", _coef("Loc_livr_marge"), op="×"),
+        _line("× Marge humain", _coef("Humain_marge"), op="×"),
+        _line("× Marge fourniture", _coef("Fourn_marge"), op="×"),
+        _line("Taux horaire", (f"{_coef('Taux_horaire')} €/h" if _coef("Taux_horaire") else None)),
+        '<div style="border-top:1px solid var(--hf-border-soft);margin:4px 0 3px"></div>',
+        _line("PU client", _eur("pu_client"), strong=True, color="#7a3019"),
+        _line("Prix client total", _eur("prix_client_tot"), color="var(--hf-muted)"),
+        "</div>",
+    ]
+    return "".join(parts)
+
+
 # Metadata loaded once for both tabs.
 families = fetch_all("SELECT id, name FROM product_families ORDER BY name")
 suppliers = fetch_all("SELECT id, name FROM suppliers ORDER BY name")
@@ -149,15 +204,14 @@ with hdr_l:
         subtitle=f"catalogue · {catalog_total:,} références".replace(",", " "),
     )
 with hdr_r:
-    b1, b2 = st.columns([1, 1])
-    with b1:
-        if st.button("⌕ recherche", key="prod_hdr_search", use_container_width=True):
-            st.session_state["cat_search_focus"] = True
+    # Single header action. (The old "⌕ recherche" button was a dead
+    # control — it only set a flag nothing read, and search already lives
+    # in the filter row below. Removed to avoid a broken affordance.)
+    _bspace, b2 = st.columns([1, 1])
     with b2:
-        # The catalogue now embeds the full edit form inline when a row is
-        # selected, so the header button only ever needs to mean "create a
-        # new product". Selecting a row in the table is enough to start
-        # editing — no extra click required.
+        # The catalogue embeds the full product card / edit form inline when
+        # a row is selected, so this button only ever needs to mean "create
+        # a new product".
         if st.button(
             "+ Nouveau produit",
             key="prod_hdr_new",
@@ -218,10 +272,13 @@ def _render_product_form(edit_id_arg):
             prefill = row
             history_df = fetch_df(
                 """
-                SELECT recorded_at, cost_ht, source, recorded_by
-                  FROM price_history
-                 WHERE product_id = :pid
-                 ORDER BY recorded_at ASC
+                SELECT ph.recorded_at, ph.cost_ht, ph.source, ph.recorded_by,
+                       ph.project_id, ph.breakdown,
+                       dp.project_name
+                  FROM price_history ph
+                  LEFT JOIN dpgf_projects dp ON dp.id = ph.project_id
+                 WHERE ph.product_id = :pid
+                 ORDER BY ph.recorded_at ASC
                 """,
                 {"pid": edit_id},
             )
@@ -524,7 +581,16 @@ def _render_product_form(edit_id_arg):
                 if abs(cost_ht - db_cost) > 0.001:
                     prev_date = "—"
                     if not history_df.empty:
-                        prev_date = pd.to_datetime(history_df.iloc[-1]["recorded_at"]).strftime("%d/%m/%Y")
+                        # Use the latest SUPPLIER-cost row (exclude client-price
+                        # signals) so the "précédent" date reflects the real
+                        # cost timeline, not a DPGF selling-price entry.
+                        _cost_only = history_df[
+                            history_df["source"].astype(str).str.lower() != "dpgf_client_price"
+                        ]
+                        if not _cost_only.empty:
+                            prev_date = pd.to_datetime(
+                                _cost_only.iloc[-1]["recorded_at"]
+                            ).strftime("%d/%m/%Y")
                     chip = hf_chip("🟢 ce prix sera enregistré dans l'historique", "ok")
                     st.markdown(
                         f'<div class="hf-row" style="gap:10px;margin-top:8px;align-items:center;font-size:11.5px">'
@@ -823,56 +889,92 @@ def _render_product_form(edit_id_arg):
         # card body's indentation at 12 (no re-indent of ~100 lines below).
         if is_edit:
           with st.container(border=True):
-            n_changes = len(history_df) if not history_df.empty else 0
+            # Two semantically different series live in price_history:
+            #   • supplier-cost rows (everything except dpgf_client_price)
+            #     → the real cost timeline. Neutral colour. Drives the
+            #     "aujourd'hui" cost + the trend line.
+            #   • client-price rows (source='dpgf_client_price') → the unit
+            #     price WE CHARGED a client on a real project. Shown RED and
+            #     in a SEPARATE block so they never pollute the cost trend.
+            if not history_df.empty:
+                _src = history_df["source"].astype(str).str.lower()
+                cost_df = history_df[_src != "dpgf_client_price"].reset_index(drop=True)
+                client_df = history_df[_src == "dpgf_client_price"].reset_index(drop=True)
+            else:
+                cost_df = history_df
+                client_df = history_df
+            n_cost = len(cost_df)
+            n_client = len(client_df)
+
             st.markdown(
                 f'<div class="hf-row hf-between" style="margin-bottom:6px">'
-                f'<h2 class="hf-h2" style="margin:0">Historique de coût</h2>'
-                f'<span class="hf-muted" style="font-size:11px">{n_changes} changement(s)</span>'
+                f'<h2 class="hf-h2" style="margin:0">Historique de prix</h2>'
+                f'<span class="hf-muted" style="font-size:11px">'
+                f'<span style="color:#262626">● {n_cost} fourn.</span> · '
+                f'<span style="color:var(--hf-terra)">● {n_client} client</span></span>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
-            if n_changes >= 2:
-                line = (
-                    alt.Chart(history_df)
-                    .mark_line(color=GREEN, strokeWidth=1.8)
-                    .encode(
+
+            # ── Dual-line chart: black = coût fournisseur, rouge = prix
+            # client. Shared € axis so the vertical gap reads as the margin.
+            SUPPLIER_INK = "#262626"
+
+            def _tip(lbl):
+                return [
+                    alt.Tooltip("recorded_at:T", title="date", format="%d/%m/%Y"),
+                    alt.Tooltip("cost_ht:Q", title=lbl, format=",.2f"),
+                    alt.Tooltip("project_name:N", title="projet"),
+                ]
+
+            chart_layers = []
+            if n_cost >= 2:
+                chart_layers.append(
+                    alt.Chart(cost_df).mark_line(color=SUPPLIER_INK, strokeWidth=1.8).encode(
                         x=alt.X("recorded_at:T", axis=None),
                         y=alt.Y("cost_ht:Q", axis=None, scale=alt.Scale(zero=False)),
                     )
                 )
-                # DPGF-sourced points (negotiated client prices) get their own
-                # TERRA dots all along the line so Vincent spots them at a
-                # glance without reading the list below.
-                dpgf_pts = (
-                    alt.Chart(
-                        history_df[history_df["source"].astype(str).str.lower() == "dpgf_return"]
+            if n_cost >= 1:
+                chart_layers.append(
+                    alt.Chart(cost_df).mark_point(color=SUPPLIER_INK, size=42, filled=True).encode(
+                        x="recorded_at:T",
+                        y=alt.Y("cost_ht:Q", axis=None, scale=alt.Scale(zero=False)),
+                        tooltip=_tip("coût fourn."),
                     )
-                    .mark_point(color=TERRA, size=55, filled=True, opacity=0.9)
-                    .encode(x="recorded_at:T", y="cost_ht:Q")
                 )
-                end_dot = (
-                    alt.Chart(history_df.iloc[-1:])
-                    .mark_point(color=TERRA, size=80, filled=True)
-                    .encode(x="recorded_at:T", y="cost_ht:Q")
+            if n_client >= 2:
+                chart_layers.append(
+                    alt.Chart(client_df).mark_line(color=TERRA, strokeWidth=1.8).encode(
+                        x=alt.X("recorded_at:T", axis=None),
+                        y=alt.Y("cost_ht:Q", axis=None, scale=alt.Scale(zero=False)),
+                    )
                 )
-                chart = (
-                    (line + dpgf_pts + end_dot)
-                    .properties(height=64)
-                    .configure_view(strokeWidth=0)
+            if n_client >= 1:
+                chart_layers.append(
+                    alt.Chart(client_df).mark_point(color=TERRA, size=42, filled=True).encode(
+                        x="recorded_at:T",
+                        y=alt.Y("cost_ht:Q", axis=None, scale=alt.Scale(zero=False)),
+                        tooltip=_tip("PU client"),
+                    )
                 )
+            if chart_layers:
+                chart = alt.layer(*chart_layers).properties(height=96).configure_view(strokeWidth=0)
                 st.altair_chart(chart, use_container_width=True)
 
-                latest_price = float(history_df.iloc[-1]["cost_ht"])
-                prev_price = float(history_df.iloc[-2]["cost_ht"])
+            # ── Today's supplier cost + delta (neutral) ──
+            if n_cost >= 2:
+                latest_price = float(cost_df.iloc[-1]["cost_ht"])
+                prev_price = float(cost_df.iloc[-2]["cost_ht"])
                 delta = latest_price - prev_price
                 pct = (delta / prev_price * 100) if prev_price else 0.0
                 delta_color = LEAF if delta > 0 else (TERRA if delta < 0 else "var(--hf-muted)")
                 delta_sign = "+" if delta > 0 else ""
-                prev_date = pd.to_datetime(history_df.iloc[-2]["recorded_at"]).strftime("%d/%m/%Y")
+                prev_date = pd.to_datetime(cost_df.iloc[-2]["recorded_at"]).strftime("%d/%m/%Y")
                 st.markdown(
-                    f'<div class="hf-row hf-between" style="align-items:baseline;margin-top:8px">'
+                    f'<div class="hf-row hf-between" style="align-items:baseline;margin-top:4px">'
                     f'<div>'
-                    f'<div class="hf-mono hf-muted" style="font-size:10px">aujourd\'hui</div>'
+                    f'<div class="hf-mono hf-muted" style="font-size:10px">coût fournisseur · aujourd\'hui</div>'
                     f'<div style="font-weight:600;font-size:22px;color:var(--hf-ink);line-height:1">{_fmt_eur(latest_price)}</div>'
                     f'</div>'
                     f'<div style="text-align:right">'
@@ -883,79 +985,104 @@ def _render_product_form(edit_id_arg):
                     f'</div>',
                     unsafe_allow_html=True,
                 )
-            elif is_edit and n_changes == 1:
-                p0 = float(history_df.iloc[0]["cost_ht"])
+            elif n_cost == 1:
+                p0 = float(cost_df.iloc[0]["cost_ht"])
                 st.markdown(
-                    f'<div class="hf-row hf-between" style="align-items:baseline;margin-top:8px">'
+                    f'<div class="hf-row hf-between" style="align-items:baseline;margin-top:4px">'
                     f'<div>'
-                    f'<div class="hf-mono hf-muted" style="font-size:10px">aujourd\'hui</div>'
+                    f'<div class="hf-mono hf-muted" style="font-size:10px">coût fournisseur · aujourd\'hui</div>'
                     f'<div style="font-weight:600;font-size:22px;color:var(--hf-ink);line-height:1">{_fmt_eur(p0)}</div>'
                     f'</div>'
-                    f'<div class="hf-muted" style="font-size:11px">création</div>'
+                    f'<div class="hf-muted" style="font-size:11px">premier coût</div>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
-            else:
+            elif n_cost == 0 and n_client == 0:
                 st.markdown(
                     '<div class="hf-muted" style="font-size:11px;padding:8px 0">'
-                    "Aucun historique pour ce produit (création en cours)."
+                    "Aucun historique de prix enregistré."
                     "</div>",
                     unsafe_allow_html=True,
                 )
 
-            if n_changes > 0:
+            def _proj_tag(name):
+                if not name or (isinstance(name, float)):
+                    return '<span class="hf-muted" style="font-size:9.5px">—</span>'
+                return (
+                    f'<span style="font-size:9.5px;color:var(--hf-muted);'
+                    f'background:var(--hf-cream);padding:1px 5px;border-radius:3px">'
+                    f'{str(name)[:18]}</span>'
+                )
+
+            # ── Table 1 · Coûts fournisseur (date · coût · projet) ──
+            if n_cost >= 1:
                 st.markdown(
-                    '<hr style="border:none;border-top:1px solid var(--hf-border-soft);margin:10px 0 8px">',
+                    '<hr style="border:none;border-top:1px solid var(--hf-border-soft);margin:10px 0 6px">'
+                    '<div style="font-size:10px;text-transform:uppercase;letter-spacing:.06em;'
+                    'font-weight:600;color:#262626;margin-bottom:4px">'
+                    '<span style="font-size:8px;vertical-align:middle">●</span> Coûts fournisseur</div>',
                     unsafe_allow_html=True,
                 )
-                moves = history_df.iloc[::-1].head(5)
                 rows_html = []
-                last_idx = len(moves) - 1
-                for j, (_, h) in enumerate(moves.iterrows()):
+                for j, (_, h) in enumerate(cost_df.iloc[::-1].head(6).iterrows()):
                     d = pd.to_datetime(h["recorded_at"]).strftime("%d/%m/%y")
                     v = f"{float(h['cost_ht']):,.2f} €".replace(",", " ")
-                    # Source-aware styling: DPGF returns (negotiated client
-                    # prices or supplier costs ingested from a signed DPGF)
-                    # get a TERRA-tinted background + a small "DPGF" tag so
-                    # they read distinctly from regular supplier prices in
-                    # the cost timeline.
-                    is_dpgf = (str(h.get("source") or "")).lower() == "dpgf_return"
-                    row_style = "font-size:10.5px;line-height:1.65;padding:2px 6px;border-radius:3px;"
-                    if is_dpgf:
-                        row_style += (
-                            "background:var(--hf-terra-soft);"
-                            "border-left:2px solid var(--hf-terra);"
-                            "padding-left:6px;"
-                        )
-                    suffix_html = ""
-                    if is_dpgf:
-                        suffix_html = (
-                            ' <span style="font-size:9px;color:var(--hf-terra);'
-                            'font-weight:600;letter-spacing:0.06em;'
-                            'text-transform:uppercase;margin-left:4px">dpgf</span>'
-                        )
-                    if j == 0:
-                        rows_html.append(
-                            f'<div class="hf-row hf-between" style="{row_style}">'
-                            f'<span class="hf-mono" style="color:var(--hf-body)">{d}</span>'
-                            f'<span style="font-weight:600">{v}{suffix_html}</span></div>'
-                        )
-                    elif j == last_idx:
-                        rows_html.append(
-                            f'<div class="hf-row hf-between" style="{row_style}">'
-                            f'<span class="hf-mono hf-muted">{d}</span>'
-                            f'<span class="hf-muted">{v} · création{suffix_html}</span></div>'
-                        )
-                    else:
-                        rows_html.append(
-                            f'<div class="hf-row hf-between" style="{row_style}">'
-                            f'<span class="hf-mono hf-muted">{d}</span>'
-                            f'<span>{v}{suffix_html}</span></div>'
-                        )
+                    weight = "600" if j == 0 else "400"
+                    color = "var(--hf-body)" if j == 0 else "var(--hf-muted)"
+                    rows_html.append(
+                        f'<div class="hf-row hf-between" style="font-size:10.5px;line-height:1.85;gap:8px">'
+                        f'<span class="hf-mono hf-muted" style="width:48px">{d}</span>'
+                        f'<span style="font-weight:{weight};color:{color};white-space:nowrap">{v}</span>'
+                        f'<span style="flex:1;text-align:right">{_proj_tag(h.get("project_name"))}</span>'
+                        f'</div>'
+                    )
+                st.markdown("".join(rows_html), unsafe_allow_html=True)
+
+            # ── Table 2 · Prix client DPGF (date · PU · projet) ──
+            if n_client >= 1:
                 st.markdown(
-                    '<div style="font-family:JetBrains Mono,monospace;'
-                    'display:flex;flex-direction:column;gap:2px">'
-                    + "".join(rows_html) + "</div>",
+                    '<hr style="border:none;border-top:1px solid var(--hf-border-soft);margin:10px 0 6px">'
+                    '<div style="font-size:10px;text-transform:uppercase;letter-spacing:.06em;'
+                    'font-weight:600;color:var(--hf-terra);margin-bottom:4px">'
+                    '<span style="font-size:8px;vertical-align:middle">●</span> Prix client (DPGF)</div>',
+                    unsafe_allow_html=True,
+                )
+                rows_html = []
+                for _, h in client_df.iloc[::-1].head(8).iterrows():
+                    d = pd.to_datetime(h["recorded_at"]).strftime("%d/%m/%y")
+                    v = f"{float(h['cost_ht']):,.2f} €".replace(",", " ")
+                    rows_html.append(
+                        f'<div class="hf-row hf-between" style="font-size:10.5px;line-height:1.7;gap:8px;'
+                        f'background:var(--hf-terra-soft);border-left:2px solid var(--hf-terra);'
+                        f'padding:2px 7px;border-radius:3px;margin-bottom:2px">'
+                        f'<span class="hf-mono" style="color:var(--hf-terra);width:46px">{d}</span>'
+                        f'<span style="font-weight:600;color:#7a3019;white-space:nowrap">{v}</span>'
+                        f'<span style="flex:1;text-align:right">{_proj_tag(h.get("project_name"))}</span>'
+                        f'</div>'
+                    )
+                st.markdown("".join(rows_html), unsafe_allow_html=True)
+
+                # ── Coefficient breakdown (per client price) ──
+                bd_rows = [
+                    h for _, h in client_df.iloc[::-1].iterrows()
+                    if isinstance(h.get("breakdown"), dict) and h["breakdown"]
+                ]
+                if bd_rows:
+                    with st.expander("▸ détail des coefficients (prix client)", expanded=False):
+                        for h in bd_rows[:5]:
+                            st.markdown(
+                                _render_breakdown(
+                                    h["breakdown"],
+                                    pd.to_datetime(h["recorded_at"]).strftime("%d/%m/%Y"),
+                                    h.get("project_name"),
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                st.markdown(
+                    '<div class="hf-muted" style="font-size:9.5px;margin-top:5px;line-height:1.45">'
+                    "↳ prix unitaire facturé au client sur un projet réel "
+                    "(≠ coût d'achat fournisseur)."
+                    "</div>",
                     unsafe_allow_html=True,
                 )
 

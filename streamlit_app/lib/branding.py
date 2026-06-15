@@ -174,7 +174,11 @@ code, pre { font-family: 'JetBrains Mono', monospace !important; font-size: 11.5
 }
 [data-testid="stSidebarNav"] li a[aria-current="page"] span { color: var(--hf-green) !important; font-weight: 600; }
 
-/* Paramètres is visible in the sidebar (was hidden in v1 — exposed in v2). */
+/* Paramètres is visible again: it now hosts the Pilotage de rentabilité
+   dashboard (per-project Prix vente / revient / Marge / KV + stored .xlsx),
+   which is day-to-day useful — not just the admin KV editor. If we ever want
+   to hide the raw settings again, split Pilotage into its own page and
+   re-add a display:none rule scoped to the settings page here. */
 
 /* sidebar brand block (rendered via render_sidebar_brand) */
 .hf-sb-brand {

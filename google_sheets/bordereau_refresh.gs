@@ -67,6 +67,10 @@ function onOpen() {
   }
 
   menu.addSeparator()
+    // applyRentabilite is defined in mr_cascade.gs — same bound-script
+    // namespace, so it's callable from here. Installs / refreshes the
+    // "Pilotage de rentabilité" recap + the SST / hidden-id columns.
+    .addItem('📊 Installer / MAJ rentabilité', 'applyRentabilite')
     .addItem('⚙ Configurer l\'URL Bordereau…', 'setBordereauUrl')
     .addToUi();
 }
@@ -140,10 +144,15 @@ function refreshBordereau() {
   const fetchUrl = url + (url.indexOf('?') >= 0 ? '&' : '?')
     + '_t=' + Date.now();
 
-  // 3. Fetch.
+  // 3. Fetch. The ngrok-skip-browser-warning header stops ngrok-free from
+  // returning its interstitial HTML page to a non-browser request (which would
+  // otherwise be parsed as garbage CSV). Harmless against the real VPS domain.
   let csv;
   try {
-    const resp = UrlFetchApp.fetch(fetchUrl, {muteHttpExceptions: true});
+    const resp = UrlFetchApp.fetch(fetchUrl, {
+      muteHttpExceptions: true,
+      headers: {'ngrok-skip-browser-warning': 'true'},
+    });
     const code = resp.getResponseCode();
     if (code !== 200) {
       throw new Error('HTTP ' + code + ' — ' + resp.getContentText().substr(0, 200));

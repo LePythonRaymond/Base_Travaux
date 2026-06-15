@@ -28,6 +28,13 @@ from lib.branding import (
     render_sidebar_brand,
 )
 from lib.db import execute, fetch_all, fetch_df, fetch_one, transaction
+from lib.pickers import (
+    FAMILY_NEW_ID,
+    LABOR_NEW_ID,
+    quick_create_labor_norm,
+    render_labor_norm_picker,
+    resolve_family,
+)
 
 UNIT_TYPES = ["u", "m3", "ml", "m2", "Ft", "kg", "l"]
 NEW_VALUE_SENTINEL = "+ Créer nouveau…"
@@ -92,9 +99,12 @@ def render_triplet_picker(
     subs_lookup: dict[int, list[str]],
     packs_lookup: dict[tuple[int, str], list[str]],
     compact: bool = False,
-) -> tuple[int | None, str, str]:
+) -> tuple[int, str, str, str]:
     """Render three cascading selectboxes (family / sub / packaging) with
-    "Créer nouveau…" sentinels. Returns the chosen (or freshly-typed) values.
+    "Créer nouveau…" sentinels on ALL THREE levels (famille included).
+    Returns (family_id, new_family_name, subcategory, packaging) where
+    family_id may be FAMILY_NEW_ID — the caller resolves it with
+    `lib.pickers.resolve_family` at commit time.
     """
     if compact:
         # Three-column row, no labels above each (caller is expected to be in
@@ -104,7 +114,7 @@ def render_triplet_picker(
         c1, c2, c3 = (st.container(), st.container(), st.container())
 
     with c1:
-        family_id_options = [f["id"] for f in families]
+        family_id_options = [f["id"] for f in families] + [FAMILY_NEW_ID]
         family_default_idx = (
             family_id_options.index(initial_family_id)
             if initial_family_id in family_id_options
@@ -114,9 +124,19 @@ def render_triplet_picker(
             "Famille",
             options=family_id_options,
             index=family_default_idx,
-            format_func=lambda i: family_by_id.get(i, str(i)),
+            format_func=lambda i: (
+                NEW_VALUE_SENTINEL if i == FAMILY_NEW_ID else family_by_id.get(i, str(i))
+            ),
             key=f"{key_prefix}_family",
         )
+        new_family_name = ""
+        if chosen_family_id == FAMILY_NEW_ID:
+            new_family_name = st.text_input(
+                "Nouvelle famille",
+                value="",
+                key=f"{key_prefix}_family_new",
+                placeholder="ex. Mobilier outdoor…",
+            ).strip()
 
     with c2:
         existing_subs = subs_lookup.get(chosen_family_id, [])
@@ -162,7 +182,7 @@ def render_triplet_picker(
                 placeholder="Conteneur 7L, Sac 25kg…",
             ).strip()
 
-    return chosen_family_id, chosen_sub or "", chosen_pack or ""
+    return chosen_family_id, new_family_name, chosen_sub or "", chosen_pack or ""
 
 
 # ============================================================================
@@ -342,7 +362,7 @@ with tab_reclass:
                         )
 
                 with sel_col:
-                    chosen_family_id, chosen_sub, chosen_pack = render_triplet_picker(
+                    chosen_family_id, chosen_new_fam, chosen_sub, chosen_pack = render_triplet_picker(
                         key_prefix=f"reclass_{pid}",
                         initial_family_id=r["family_id"],
                         initial_subcategory=None,
@@ -355,6 +375,7 @@ with tab_reclass:
                 with btn_col:
                     ready = (
                         chosen_family_id is not None
+                        and (chosen_family_id != FAMILY_NEW_ID or chosen_new_fam)
                         and chosen_sub
                         and chosen_sub != "À classifier"
                         and chosen_pack
@@ -371,8 +392,9 @@ with tab_reclass:
                     ):
                         try:
                             with transaction(ingestion_source="admin_streamlit") as conn:
+                                _fid = resolve_family(conn, chosen_family_id, chosen_new_fam)
                                 _ensure_taxonomy_row(
-                                    conn, chosen_family_id, chosen_sub, chosen_pack
+                                    conn, _fid, chosen_sub, chosen_pack
                                 )
                                 conn.execute(
                                     text(
@@ -385,7 +407,7 @@ with tab_reclass:
                                         """
                                     ),
                                     {
-                                        "fid": chosen_family_id,
+                                        "fid": _fid,
                                         "sub": chosen_sub,
                                         "pkg": chosen_pack,
                                         "id": pid,
@@ -415,7 +437,7 @@ with tab_reclass:
         with bar_m:
             if n_sel > 0:
                 with st.expander("≡ appliquer le même triplet à la sélection", expanded=False):
-                    bf_id, bf_sub, bf_pack = render_triplet_picker(
+                    bf_id, bf_new_fam, bf_sub, bf_pack = render_triplet_picker(
                         key_prefix="batch_apply",
                         initial_family_id=None,
                         initial_subcategory=None,
@@ -425,7 +447,9 @@ with tab_reclass:
                         compact=True,
                     )
                     batch_ready = (
-                        bf_id is not None and bf_sub and bf_sub != "À classifier" and bf_pack
+                        bf_id is not None
+                        and (bf_id != FAMILY_NEW_ID or bf_new_fam)
+                        and bf_sub and bf_sub != "À classifier" and bf_pack
                     )
                     if st.button(
                         f"✓ classer {n_sel} produit(s) en une fois",
@@ -435,7 +459,8 @@ with tab_reclass:
                     ):
                         try:
                             with transaction(ingestion_source="admin_streamlit") as conn:
-                                _ensure_taxonomy_row(conn, bf_id, bf_sub, bf_pack)
+                                _bfid = resolve_family(conn, bf_id, bf_new_fam)
+                                _ensure_taxonomy_row(conn, _bfid, bf_sub, bf_pack)
                                 for pid in list(st.session_state["reclass_selected"]):
                                     conn.execute(
                                         text(
@@ -448,7 +473,7 @@ with tab_reclass:
                                               AND subcategory = 'À classifier'
                                             """
                                         ),
-                                        {"fid": bf_id, "sub": bf_sub, "pkg": bf_pack, "id": pid},
+                                        {"fid": _bfid, "sub": bf_sub, "pkg": bf_pack, "id": pid},
                                     )
                             n_done = len(st.session_state["reclass_selected"])
                             st.session_state["reclass_selected"] = set()
@@ -551,7 +576,7 @@ with tab_needs_info:
                     )
                     family_hint = (q["candidate_family_hint"] or "").lower()
                     initial_family_id = family_by_name_lower.get(family_hint)
-                    chosen_family_id, chosen_sub, chosen_pack = render_triplet_picker(
+                    chosen_family_id, chosen_new_fam, chosen_sub, chosen_pack = render_triplet_picker(
                         key_prefix=f"qni_triplet_{q['id']}",
                         initial_family_id=initial_family_id,
                         initial_subcategory=None,
@@ -592,31 +617,28 @@ with tab_needs_info:
                         else next((s["name"] for s in suppliers if s["id"] == i), str(i)),
                         key=f"qni_sup_{q['id']}",
                     )
-                    ln_options = [None] + [ln["id"] for ln in labor_norms]
-                    ln_default_idx = (
-                        ln_options.index(q["candidate_labor_norm_id"])
-                        if q["candidate_labor_norm_id"] in ln_options
-                        else 0
+                    _labor_by_id = {ln["id"]: ln["task_name"] for ln in labor_norms}
+                    norm_pick = render_labor_norm_picker(
+                        key_prefix=f"qni_ln_{q['id']}",
+                        labor_norms=labor_norms,
+                        labor_by_id=_labor_by_id,
+                        default_unit=unit_type,
+                        initial_labor_norm_id=q["candidate_labor_norm_id"],
+                        label="Norme de pose *",
                     )
-                    labor_norm_id = st.selectbox(
-                        "Norme de pose *",
-                        options=ln_options,
-                        index=ln_default_idx,
-                        format_func=lambda i: "(non choisie)"
-                        if i is None
-                        else next((ln["task_name"] for ln in labor_norms if ln["id"] == i), str(i)),
-                        key=f"qni_ln_{q['id']}",
-                    )
+                    labor_norm_id = norm_pick["labor_norm_id"]
 
                 ready = (
                     ref_name.strip()
                     and chosen_family_id is not None
+                    and (chosen_family_id != FAMILY_NEW_ID or chosen_new_fam)
                     and chosen_sub
                     and chosen_sub != "À classifier"
                     and chosen_pack
                     and cost_ht > 0
                     and supplier_id is not None
                     and labor_norm_id is not None
+                    and (labor_norm_id != LABOR_NEW_ID or norm_pick["new_name"])
                 )
                 cb1, cb2 = st.columns(2)
                 with cb1:
@@ -630,7 +652,14 @@ with tab_needs_info:
                         try:
                             actor = os.environ.get("STREAMLIT_AUTH_USER", "system")
                             with transaction(ingestion_source=q["source"]) as conn:
-                                _ensure_taxonomy_row(conn, chosen_family_id, chosen_sub, chosen_pack)
+                                _fid = resolve_family(conn, chosen_family_id, chosen_new_fam)
+                                _lid = labor_norm_id
+                                if _lid == LABOR_NEW_ID:
+                                    _lid = quick_create_labor_norm(
+                                        conn, norm_pick["new_name"],
+                                        norm_pick["new_unit"], norm_pick["new_pose_hours"],
+                                    )
+                                _ensure_taxonomy_row(conn, _fid, chosen_sub, chosen_pack)
                                 res = conn.execute(
                                     text(
                                         """
@@ -652,10 +681,10 @@ with tab_needs_info:
                                     ),
                                     {
                                         "ref": ref_name.strip(),
-                                        "fid": chosen_family_id,
+                                        "fid": _fid,
                                         "sub": chosen_sub,
                                         "sup": supplier_id,
-                                        "ln": labor_norm_id,
+                                        "ln": _lid,
                                         "pkg": chosen_pack,
                                         "unit": unit_type,
                                         "cost": float(cost_ht),
@@ -693,7 +722,7 @@ with tab_needs_info:
                                     ),
                                     {
                                         "by": actor, "pid": product_id, "sup": supplier_id,
-                                        "ln": labor_norm_id, "id": q["id"],
+                                        "ln": _lid, "id": q["id"],
                                     },
                                 )
                             st.toast(

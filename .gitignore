@@ -4,6 +4,13 @@
 # Source PDFs (may contain confidential supplier data)
 data/invoices/*.pdf
 
+# Database dumps / backups (never commit data)
+backup_*.sql
+*.dump
+
+# Bulk-ingestion source files (confidential supplier/client DPGFs, invoices)
+/sources/
+
 # Python
 __pycache__/
 *.py[cod]

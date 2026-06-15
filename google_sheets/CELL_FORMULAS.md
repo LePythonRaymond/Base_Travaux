@@ -83,6 +83,75 @@ The `=IMPORTDATA(...)` formula in **Bordereau!A1** does NOT change — the endpo
 
 **Rule of thumb**: any DPGF-tab formula that references a DPGF column AE-BB in the old layout must be bumped by +1 letter (AE → AF, AF → AG, …, BB → BC). AA-AD references are unchanged.
 
+### 3. DPGF tab — hidden stable product-id column at **BE** (NEW)
+
+So reverse-ingestion can match a line to its DB product **exactly** (instead of fuzzy-matching the picker string), the DPGF carries the product database `id` in a hidden column **BE** that resolves it from the picked product:
+
+| Cell | Formula |
+|------|---------|
+| `BE3` (and fill down to BE502) | `=IFERROR(INDEX(Bordereau!A:A, MATCH(AG3, Helpers!A:A, 0)), "")` |
+
+**Easiest way to add it:** this is the *same lookup pattern* as the Fournisseur
+(AI) and Fraîcheur (AJ) columns already in the sheet. Copy `AI3`, paste into
+`BE3`, and change the INDEX range to `Bordereau!A:A` (the product id). Fill down,
+then hide the column.
+
+- `Bordereau!A` is the product `id` (column A of `/api/bordereau.csv`).
+- `Helpers!A` is the picker concat string that `AG` validates against (`Famille — Sous-cat — Référence — Cond.`), row-aligned with `Bordereau`.
+- So BE = "the DB id of whatever product the user picked in AG", or blank if AG is empty / a manual override.
+- **Hide the column** (right-click BE → Hide) — it's plumbing, not for the client or Vincent.
+- The reverse-ingestion parser (`lib/dpgf.py`, `COL_BE = 57`) reads it; when blank/absent it falls back to picker + fuzzy matching, so **older DPGFs without this column keep working**.
+- A blank BE on a line that DOES have a price (Vincent typed a manual price over the formula for a product not in the DB) is exactly the signal the Retour-DPGF "needs clarification" step uses to ask for taxonomy/supplier/norme.
+
+This is a passive lookup column — no cascade-logic change in `mr_cascade.gs` is required.
+
+### 4. Tab renamed **`Paramètres` → `Pilotage de rentabilité`** + rentability recap (NEW)
+
+The project-settings tab is renamed **`Pilotage de rentabilité`** and now hosts a
+**live rentability recap** computed by formulas — the same block Vincent sees at the
+bottom of his working xlsx. **The sheet is the source of truth**; the Streamlit app
+*reads* these cells (it no longer re-derives the numbers).
+
+**Presentation layout** (rows 20+): **col A = human label · col B = value · col C =
+machine identifier (HIDDEN)**. Vincent sees a clean styled card (green section bands
+*Temps chantier* / *Rentabilité — GLOBAL* / *Hors SST*, bold right-aligned values, KV
++ marge in green, the planning inputs *Personnes / heures…* in the yellow input
+colour). Reverse-ingestion matches on the **col-C identifier** and reads the **col-B
+value** (`lib/dpgf.py::_read_project_recap_cells`). Coefficients (rows 6–12, A=id /
+B=value) and column mappings (rows 16–18) are unchanged.
+
+Identifier (col C) → formula/value (col B):
+
+| Row | C (identifier — parser key) | B (formula / input) |
+|----|----|----|
+| 21 | `Tps_chantier` | `=SUMPRODUCT(IFERROR((DPGF!AK3:AK502+DPGF!AL3:AL502)*DPGF!AM3:AM502*DPGF!AC3:AC502, 0))` |
+| 22 | `Personnes` | **input** (équipe, ex. 5) |
+| 23 | `Heures_par_jour` | **input** (ex. 7) |
+| 24 | `Jours_par_semaine` | **input** (ex. 5) |
+| 25 | `Semaines_par_mois` | **input** (ex. 4,48) |
+| 26 | `Jours` | `=IF(Personnes*Heures_par_jour=0,"",Tps_chantier/(Personnes*Heures_par_jour))` |
+| 27 | `Semaines` | `=IF(Jours_par_semaine=0,"",Jours/Jours_par_semaine)` |
+| 28 | `Mois` | `=IF(Semaines_par_mois=0,"",Semaines/Semaines_par_mois)` |
+| 31 | `Rent_prix_vente` | `=SUM(DPGF!BB3:BB502)` |
+| 32 | `Rent_prix_revient` | `=SUM(DPGF!AT3:AT502)+SUM(DPGF!AU3:AU502)+SUM(DPGF!AV3:AV502)+SUM(DPGF!AW3:AW502)+SUM(DPGF!AX3:AX502)` |
+| 33 | `Rent_marge_eur` | `=Rent_prix_vente-Rent_prix_revient` |
+| 34 | `Rent_marge_pct` | `=IF(Rent_prix_vente=0,"",Rent_marge_eur/Rent_prix_vente*100)` |
+| 35 | `Rent_kv` | `=IF(Rent_prix_revient=0,"",Rent_prix_vente/Rent_prix_revient)` |
+| 38 | `Rent_hs_prix_vente` | `=SUMIFS(DPGF!BB3:BB502, DPGF!BD3:BD502, FALSE)` |
+| 39 | `Rent_hs_prix_revient` | `=SUMIFS(DPGF!AT…,BD,FALSE)+…+SUMIFS(DPGF!AX…,BD,FALSE)` |
+| 40 | `Rent_hs_marge_eur` | `=Rent_hs_prix_vente-Rent_hs_prix_revient` |
+| 41 | `Rent_hs_marge_pct` | `=IF(Rent_hs_prix_vente=0,"",Rent_hs_marge_eur/Rent_hs_prix_vente*100)` |
+| 42 | `Rent_hs_kv` | `=IF(Rent_hs_prix_revient=0,"",Rent_hs_prix_vente/Rent_hs_prix_revient)` |
+
+- **Marge % is stored ×100** (e.g. `17,75`) with a literal-`%` number format (`0,00"%"`), so the parser reads `17.75` directly and it lines up with the app.
+- **`BD` (col 56) = `SST ?`** — a **checkbox** on `BD3:BD502`. Ticked = sous-traitant line, **excluded** from the Hors-SST block (the `SUMIFS(…, BD, FALSE)` formulas).
+- **`BF` (col 58) = `Commentaire`** — a **wide (340 px) free-text** column on `BF3:BF502`, filled with the **yellow input colour** (`#FFF2CC`) + wrap, for per-line / per-section notes by Vincent. It's the last visible column (BE is hidden). Not read by the app — purely for Vincent.
+- Workbook-scoped **named ranges** are created for the cells referenced by name (`Tps_chantier`, `Personnes`, `Rent_prix_vente`, …) — same as the coefficients.
+
+**How to apply:** all of the above (rename, styled recap block, named ranges, `BD` checkbox, hidden `BE` id column, `BF` Commentaire column) is written by the Apps-Script function **`applyRentabilite()`** — run once on the master via the 🌿 *Merci Raymond → 📊 Installer / MAJ rentabilité* menu (it's also called at the end of `applyV24Patch()`). Idempotent; INPUT cells are only set when blank, so re-running never clobbers Vincent's tuning. Named ranges don't survive *Faire une copie*, so run the menu item once per fresh copy.
+
+> **Fidelity note:** the `prix_revient` composition (whether *install chantier* / *log gestion* are cost or margin) and the `Tps_chantier` hours basis should be reverse-checked against Vincent's real "doc de travail" xlsx — the formulas above are self-consistent and match the app's existing model, but the exact target values (revient 1 003 491,67 etc.) depend on his definitions.
+
 ## Specific formulas to change
 
 For each formula below, the syntax assumes a data row `14`. Replicate down whatever range the sheet uses (likely rows 3 to 502, in line with `DATA_FIRST_ROW` and `BORDEREAU_LAST_ROW` in `mr_cascade.gs`).

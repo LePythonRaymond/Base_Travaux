@@ -39,6 +39,13 @@ from lib.branding import (
     render_sidebar_brand,
 )
 from lib.db import fetch_all, fetch_one, get_engine, transaction
+from lib.pickers import (
+    FAMILY_NEW_ID,
+    LABOR_NEW_ID,
+    quick_create_labor_norm,
+    render_labor_norm_picker,
+    resolve_family,
+)
 from lib.gemini import extract_invoice
 from lib.matcher import find_similar_lines, match
 from lib.schemas import ExtractedInvoice, ExtractionError
@@ -474,10 +481,22 @@ if S["ing_step"] == "review":
     for ls in lines_state:
         status = ls.get("status") or "À décider"
         cost = float(ls.get("cost_ht") or 0)
-        triplet_ok = (
+        # An inline "+ créer nouveau…" famille / norme isn't ready until its
+        # name is typed, otherwise the resolver would fail at commit.
+        family_ok = (
             ls.get("family_id") is not None
+            and (ls.get("family_id") != FAMILY_NEW_ID
+                 or bool((ls.get("new_family_name") or "").strip()))
+        )
+        norm_ok = (
+            ls.get("labor_norm_id") != LABOR_NEW_ID
+            or bool((ls.get("new_norm_name") or "").strip())
+        )
+        triplet_ok = (
+            family_ok
             and bool((ls.get("subcategory") or "").strip())
             and bool((ls.get("packaging") or "").strip())
+            and norm_ok
         )
         if status == "Rejeter":
             rejected_count += 1
@@ -680,7 +699,7 @@ if S["ing_step"] == "review":
                     )
                 with f2:
                     hint_id = family_by_name.get((ls.get("family_hint") or "").lower())
-                    family_opts_strict = [f["id"] for f in families]
+                    family_opts_strict = [f["id"] for f in families] + [FAMILY_NEW_ID]
                     idx_f = (
                         family_opts_strict.index(hint_id)
                         if hint_id in family_opts_strict
@@ -694,9 +713,19 @@ if S["ing_step"] == "review":
                         "Famille *",
                         options=family_opts_strict,
                         index=idx_f,
-                        format_func=lambda o: family_by_id.get(o, str(o)),
+                        format_func=lambda o: (
+                            NEW_VALUE_SENTINEL if o == FAMILY_NEW_ID
+                            else family_by_id.get(o, str(o))
+                        ),
                         key=f"family_{i}",
                     )
+                    if ls["family_id"] == FAMILY_NEW_ID:
+                        ls["new_family_name"] = st.text_input(
+                            "Nouvelle famille",
+                            value=ls.get("new_family_name", ""),
+                            key=f"family_new_{i}",
+                            placeholder="ex. Mobilier outdoor…",
+                        ).strip()
                 with f3:
                     existing_subs = subs_by_family.get(ls["family_id"], [])
                     sub_options = existing_subs + [NEW_VALUE_SENTINEL]
@@ -765,16 +794,18 @@ if S["ing_step"] == "review":
                     if suggested_id is None:
                         fb = labor_by_name.get("Norme par défaut (à classifier)")
                         suggested_id = fb["id"] if fb else (labor_norms[0]["id"] if labor_norms else None)
-                    ln_idx = labor_options.index(suggested_id) if suggested_id in labor_options else 0
-                    ls["labor_norm_id"] = st.selectbox(
-                        "Norme de pose",
-                        options=labor_options,
-                        index=ln_idx,
-                        format_func=lambda o: "—" if o is None else next(
-                            (ln["task_name"] for ln in labor_norms if ln["id"] == o), str(o)
-                        ),
-                        key=f"labor_{i}",
+                    _labor_by_id = {ln["id"]: ln["task_name"] for ln in labor_norms}
+                    _norm_pick = render_labor_norm_picker(
+                        key_prefix=f"labor_{i}",
+                        labor_norms=labor_norms,
+                        labor_by_id=_labor_by_id,
+                        default_unit=ls.get("unit_type") or "u",
+                        initial_labor_norm_id=suggested_id,
                     )
+                    ls["labor_norm_id"] = _norm_pick["labor_norm_id"]
+                    ls["new_norm_name"] = _norm_pick["new_name"]
+                    ls["new_norm_unit"] = _norm_pick["new_unit"]
+                    ls["new_norm_pose"] = _norm_pick["new_pose_hours"]
                 with h2:
                     matched_pid = ls.get("matched_product_id")
                     if isinstance(matched_pid, int) and matched_pid in product_options:
@@ -944,13 +975,24 @@ if S["ing_step"] == "review":
                     if float(ls.get("cost_ht") or 0) <= 0:
                         continue
 
+                    # Resolve any inline-created famille / norme to real ids
+                    # before the taxonomy + product writes (so the FKs hold).
+                    _fid = resolve_family(conn, ls.get("family_id"), ls.get("new_family_name"))
+                    _lid = ls.get("labor_norm_id")
+                    if _lid == LABOR_NEW_ID:
+                        _lid = quick_create_labor_norm(
+                            conn, ls.get("new_norm_name"),
+                            ls.get("new_norm_unit") or ls["unit_type"],
+                            ls.get("new_norm_pose") or 0,
+                        )
+
                     attrs_json = json.dumps(ls.get("attributes") or {}, ensure_ascii=False)
                     common = {
                         "ref": ls["reference_name"].strip(),
-                        "family_id": ls.get("family_id"),
+                        "family_id": _fid,
                         "subcategory": (ls.get("subcategory") or "").strip(),
                         "supplier_id": supplier_id,
-                        "labor_norm_id": ls.get("labor_norm_id"),
+                        "labor_norm_id": _lid,
                         "brand": ls.get("brand") or None,
                         "material": ls.get("material") or None,
                         "packaging": ls["packaging"].strip(),
