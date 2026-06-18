@@ -71,10 +71,10 @@ services:
       - traefik.http.routers.mrprices.priority=10
       - traefik.http.routers.mrprices.service=mrprices
       - traefik.http.services.mrprices.loadbalancer.server.port=8501
-      # basic-auth (user:bcrypt). If Traefik rejects a correct password, the $
-      # in the hash got mangled — hardcode this label single-quoted instead.
-      - "traefik.http.middlewares.mrauth.basicauth.users=${STREAMLIT_AUTH_USER}:${STREAMLIT_AUTH_PASSWORD_HASH}"
-      - traefik.http.routers.mrprices.middlewares=mrauth
+      # NOTE: no proxy basic-auth — the Streamlit app gates EVERY page itself via
+      # lib/auth.require_login() (same bcrypt hash), so a single in-app login is
+      # enough. (Re-add a traefik basicauth middleware here if you ever want the
+      # extra browser-prompt layer back.)
 
   bordereau_api:
     build: ./bordereau_api
