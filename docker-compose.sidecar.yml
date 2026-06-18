@@ -1,0 +1,113 @@
+# =============================================================================
+# SIDECAR deployment — run the pricing app NEXT TO an existing n8n stack
+# =============================================================================
+# For a Hostinger VPS that already runs the n8n template (Traefik v2.10 owning
+# 80/443, cert-resolver `mytlschallenge`, docker provider on network
+# `root_merci_net`). This file adds the pricing app as its OWN isolated stack and
+# lets the EXISTING Traefik route + TLS it. It does NOT install Coolify and does
+# NOT touch n8n, its Postgres, or the Traefik config.
+#
+#   - Own Postgres (no host port → cannot clash with n8n's postgres on 5432).
+#   - streamlit (8501) + bordereau_api (8000) join `root_merci_net` so Traefik
+#     can reach them; postgres stays on a private `mrnet` only.
+#   - Labels mirror the n8n router style: entrypoints web,websecure + tls +
+#     certresolver=mytlschallenge (read off your box, not Coolify defaults).
+#
+# Deploy:
+#   cd merci-raymond-pricing
+#   cp .env.sidecar.template .env   # then fill it in
+#   docker compose -f docker-compose.sidecar.yml -p mrprices up -d --build
+#
+# Routes (once up): https://${PUBLIC_DOMAIN}/        → Streamlit (basic-auth)
+#                   https://${PUBLIC_DOMAIN}/api/... → bordereau API (X-API-Key)
+# =============================================================================
+
+services:
+
+  postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - mr_postgres_data:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro   # runs ONLY on first boot (empty vol)
+    networks: [mrnet]                            # private — NOT on root_merci_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - traefik.enable=false
+
+  streamlit:
+    build: ./streamlit_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      STREAMLIT_AUTH_USER: ${STREAMLIT_AUTH_USER}
+      STREAMLIT_AUTH_PASSWORD_HASH: ${STREAMLIT_AUTH_PASSWORD_HASH}
+      INVOICE_DIR: /data/invoices
+    volumes:
+      - mr_invoices_data:/data/invoices
+    networks: [mrnet, root_merci_net]
+    expose:
+      - "8501"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=root_merci_net           # which net Traefik reaches it on
+      # --- Admin UI: catch-all on the host, behind basic-auth (low priority) ---
+      - "traefik.http.routers.mrprices.rule=Host(`${PUBLIC_DOMAIN}`)"
+      - traefik.http.routers.mrprices.entrypoints=web,websecure
+      - traefik.http.routers.mrprices.tls=true
+      - traefik.http.routers.mrprices.tls.certresolver=mytlschallenge
+      - traefik.http.routers.mrprices.priority=10
+      - traefik.http.routers.mrprices.service=mrprices
+      - traefik.http.services.mrprices.loadbalancer.server.port=8501
+      # basic-auth (user:bcrypt). If Traefik rejects a correct password, the $
+      # in the hash got mangled — hardcode this label single-quoted instead.
+      - "traefik.http.middlewares.mrauth.basicauth.users=${STREAMLIT_AUTH_USER}:${STREAMLIT_AUTH_PASSWORD_HASH}"
+      - traefik.http.routers.mrprices.middlewares=mrauth
+
+  bordereau_api:
+    build: ./bordereau_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      BORDEREAU_API_KEY: ${BORDEREAU_API_KEY}
+    networks: [mrnet, root_merci_net]
+    expose:
+      - "8000"
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=root_merci_net
+      # --- Public API: /api/* on the same host, NO basic-auth (high priority).
+      #     Auth is enforced inside FastAPI via X-API-Key / ?key=. The API
+      #     defines its routes as /api/... already, so NO path-strip needed.
+      - "traefik.http.routers.mrapi.rule=Host(`${PUBLIC_DOMAIN}`) && PathPrefix(`/api`)"
+      - traefik.http.routers.mrapi.entrypoints=web,websecure
+      - traefik.http.routers.mrapi.tls=true
+      - traefik.http.routers.mrapi.tls.certresolver=mytlschallenge
+      - traefik.http.routers.mrapi.priority=100
+      - traefik.http.routers.mrapi.service=mrapi
+      - traefik.http.services.mrapi.loadbalancer.server.port=8000
+
+volumes:
+  mr_postgres_data:
+  mr_invoices_data:
+
+networks:
+  root_merci_net:        # the EXISTING network Traefik is on — reuse, don't create
+    external: true
+  mrnet:                 # private app↔db network
+    driver: bridge

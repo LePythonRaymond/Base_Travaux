@@ -28,6 +28,7 @@ VALID_SOURCES = {
     "admin_streamlit",     # manual entry — bypasses ingestion_queue
     "supplier_catalog",    # invoice-extracted, reviewed
     "historical_devis",    # bulk import of past devis (future)
+    "historical_dpgf",     # one-time pre-launch load mined from Vincent's worked DPGFs
     "dpgf_return",         # reverse-ingested S cells (future)
     "direct_update",       # fallback the trigger uses if SET LOCAL was missed
 }
