@@ -37,6 +37,7 @@
  */
 
 const REFRESH_DOC_PROP_URL = 'BORDEREAU_URL';
+const REFRESH_DOC_PROP_TAXO_URL = 'TAXONOMY_URL';
 const REFRESH_DOC_PROP_INTERVAL = 'BORDEREAU_AUTO_INTERVAL';
 const REFRESH_MENU_NAME = '🌿 Merci Raymond';
 
@@ -46,7 +47,7 @@ const REFRESH_MENU_NAME = '🌿 Merci Raymond';
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
   const menu = ui.createMenu(REFRESH_MENU_NAME)
-    .addItem('↻ Rafraîchir le Bordereau', 'refreshBordereau')
+    .addItem('↻ Rafraîchir (Bordereau + Taxonomy)', 'refreshAll')
     .addSeparator();
 
   const interval = PropertiesService.getDocumentProperties()
@@ -72,118 +73,116 @@ function onOpen() {
     // "Pilotage de rentabilité" recap + the SST / hidden-id columns.
     .addItem('📊 Installer / MAJ rentabilité', 'applyRentabilite')
     .addItem('⚙ Configurer l\'URL Bordereau…', 'setBordereauUrl')
+    .addItem('⚙ Configurer l\'URL Taxonomy…', 'setTaxonomyUrl')
     .addToUi();
 }
 
 /* ───────────────────────────────────────────────────────────────────
    Manual URL configuration.
    ─────────────────────────────────────────────────────────────────── */
-function setBordereauUrl() {
+function setBordereauUrl() { _setUrlProp_(REFRESH_DOC_PROP_URL, 'Bordereau'); }
+function setTaxonomyUrl()  { _setUrlProp_(REFRESH_DOC_PROP_TAXO_URL, 'Taxonomy'); }
+
+function _setUrlProp_(propKey, label) {
   const ui = SpreadsheetApp.getUi();
   const props = PropertiesService.getDocumentProperties();
-  const current = props.getProperty(REFRESH_DOC_PROP_URL) || '(aucune)';
+  const current = props.getProperty(propKey) || '(aucune)';
   const resp = ui.prompt(
-    'URL du Bordereau',
+    'URL du ' + label,
     'Colle ici l\'URL complète (incluant ?key=… si présente) :\n\n' +
     'Actuelle : ' + current,
     ui.ButtonSet.OK_CANCEL
   );
   if (resp.getSelectedButton() !== ui.Button.OK) return;
   const url = resp.getResponseText().trim();
-  if (!url) {
-    ui.alert('URL vide — pas de changement.');
-    return;
-  }
+  if (!url) { ui.alert('URL vide — pas de changement.'); return; }
   if (!/^https?:\/\//i.test(url)) {
     ui.alert('URL invalide — elle doit commencer par http:// ou https://.');
     return;
   }
-  props.setProperty(REFRESH_DOC_PROP_URL, url);
-  ui.alert(
-    'URL enregistrée. Tu peux maintenant lancer ↻ Rafraîchir le Bordereau.'
-  );
+  props.setProperty(propKey, url);
+  ui.alert('URL ' + label + ' enregistrée. Tu peux lancer ↻ Rafraîchir (Bordereau + Taxonomy).');
 }
 
 /* ───────────────────────────────────────────────────────────────────
-   Core refresh — fetches the CSV and writes it to the Bordereau tab.
-   Callable from the menu, from a time-driven trigger, or by another
-   script. Returns the number of data rows written (header row excluded)
-   for logging.
-   ─────────────────────────────────────────────────────────────────── */
-function refreshBordereau() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName('Bordereau');
-  if (!sheet) {
-    SpreadsheetApp.getUi().alert('Onglet « Bordereau » introuvable.');
-    return 0;
-  }
+   Core refresh — fetches a CSV endpoint and writes it to a tab. Generic
+   over (tab, stored-URL property) so the SAME logic refreshes both the
+   Bordereau and the Taxonomy tabs cache-free.
 
-  // 1. Resolve the URL. First-run convenience: if document property is
-  // empty and Bordereau!A1 holds an IMPORTDATA formula, lift the URL out
-  // of it and persist it so subsequent runs work even after we
-  // overwrite A1 with raw data.
+   TRIGGER-SAFE: never calls getUi() (which throws in a time-driven trigger
+   context). Returns the data-row count on success, or a negative status:
+     -1 = no URL configured, -2 = HTTP/fetch error, -3 = empty CSV.
+   ─────────────────────────────────────────────────────────────────── */
+function _refreshTab_(tabName, propKey) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(tabName);
+  if (!sheet) return -1;
+
+  // Resolve the URL. First-run convenience: if the stored property is empty
+  // and A1 holds an IMPORTDATA formula, lift the URL out of it and persist it
+  // (so it survives even after we overwrite A1 with raw data).
   const props = PropertiesService.getDocumentProperties();
-  let url = props.getProperty(REFRESH_DOC_PROP_URL);
+  let url = props.getProperty(propKey);
   if (!url) {
     const formula = sheet.getRange('A1').getFormula();
     const m = formula && formula.match(/IMPORTDATA\(\s*["']([^"']+)["']/i);
-    if (m) {
-      url = m[1];
-      props.setProperty(REFRESH_DOC_PROP_URL, url);
-    } else {
-      SpreadsheetApp.getUi().alert(
-        'URL introuvable. Va dans  ' + REFRESH_MENU_NAME +
-        '  → ⚙ Configurer l\'URL Bordereau pour la définir.'
-      );
-      return 0;
-    }
+    if (m) { url = m[1]; props.setProperty(propKey, url); }
+    else return -1;
   }
 
-  // 2. Append a cache-busting timestamp so any intermediary (CDN, etc.)
-  // can't serve stale data.
-  const fetchUrl = url + (url.indexOf('?') >= 0 ? '&' : '?')
-    + '_t=' + Date.now();
+  // Cache-busting timestamp so no intermediary serves stale data.
+  const fetchUrl = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_t=' + Date.now();
 
-  // 3. Fetch. The ngrok-skip-browser-warning header stops ngrok-free from
-  // returning its interstitial HTML page to a non-browser request (which would
-  // otherwise be parsed as garbage CSV). Harmless against the real VPS domain.
+  // Fetch. The ngrok-skip-browser-warning header is harmless against the VPS
+  // domain and stops ngrok-free from returning its interstitial HTML page.
   let csv;
   try {
     const resp = UrlFetchApp.fetch(fetchUrl, {
       muteHttpExceptions: true,
       headers: {'ngrok-skip-browser-warning': 'true'},
     });
-    const code = resp.getResponseCode();
-    if (code !== 200) {
-      throw new Error('HTTP ' + code + ' — ' + resp.getContentText().substr(0, 200));
-    }
+    if (resp.getResponseCode() !== 200) return -2;
     csv = resp.getContentText();
-  } catch (err) {
-    SpreadsheetApp.getUi().alert('Erreur de fetch : ' + err.message);
-    return 0;
-  }
+  } catch (err) { return -2; }
 
-  // 4. Parse the CSV.
   const rows = Utilities.parseCsv(csv);
-  if (!rows || rows.length === 0) {
-    SpreadsheetApp.getUi().alert('Le bordereau renvoyé est vide.');
-    return 0;
-  }
+  if (!rows || rows.length === 0) return -3;
 
-  // 5. Write. We blank the previous range first so a SHRINKING bordereau
-  // (= a deleted product) doesn't leave stale rows at the bottom.
+  // Blank the previous range first so a SHRINKING dataset (deleted row)
+  // doesn't leave stale rows at the bottom.
   const lastRow = sheet.getLastRow();
   const lastCol = sheet.getLastColumn();
-  if (lastRow > 0 && lastCol > 0) {
-    sheet.getRange(1, 1, lastRow, lastCol).clearContent();
-  }
+  if (lastRow > 0 && lastCol > 0) sheet.getRange(1, 1, lastRow, lastCol).clearContent();
   sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+  return rows.length - 1;   // data rows (header excluded)
+}
 
-  ss.toast(
-    '✓ Bordereau rafraîchi (' + (rows.length - 1) + ' produits)',
-    REFRESH_MENU_NAME, 4
+/* Per-tab wrappers. Callable from the menu (toast feedback) or other code. */
+function refreshBordereau() { return _toastRefresh_('Bordereau', _refreshTab_('Bordereau', REFRESH_DOC_PROP_URL)); }
+function refreshTaxonomy()  { return _toastRefresh_('Taxonomy',  _refreshTab_('Taxonomy',  REFRESH_DOC_PROP_TAXO_URL)); }
+
+/* Both tabs in one go — this is what the time-driven trigger calls so the
+   Bordereau AND the Taxonomy stay fresh on the same interval. */
+function refreshAll() {
+  const b = _refreshTab_('Bordereau', REFRESH_DOC_PROP_URL);
+  const t = _refreshTab_('Taxonomy',  REFRESH_DOC_PROP_TAXO_URL);
+  SpreadsheetApp.getActive().toast(
+    '↻ Bordereau : ' + _statusText_(b) + '  ·  Taxonomy : ' + _statusText_(t),
+    REFRESH_MENU_NAME, 5
   );
-  return rows.length - 1;
+  return {bordereau: b, taxonomy: t};
+}
+
+function _toastRefresh_(label, n) {
+  SpreadsheetApp.getActive().toast(label + ' : ' + _statusText_(n), REFRESH_MENU_NAME, 4);
+  return n;
+}
+
+function _statusText_(n) {
+  if (n >= 0) return '✓ ' + n + ' lignes';
+  if (n === -1) return '⚠ URL non configurée';
+  if (n === -2) return '⚠ injoignable (HTTP)';
+  return '⚠ vide';
 }
 
 /* ───────────────────────────────────────────────────────────────────
@@ -196,15 +195,16 @@ function enableAutoRefresh60() { _enableAutoRefresh(60); }
 
 function _enableAutoRefresh(minutes) {
   _removeRefreshTriggers();
-  ScriptApp.newTrigger('refreshBordereau')
+  // refreshAll → both Bordereau + Taxonomy on every tick.
+  ScriptApp.newTrigger('refreshAll')
     .timeBased()
     .everyMinutes(minutes)
     .create();
   PropertiesService.getDocumentProperties()
     .setProperty(REFRESH_DOC_PROP_INTERVAL, String(minutes));
   SpreadsheetApp.getUi().alert(
-    '✓ Rafraîchissement automatique activé toutes les ' + minutes + ' min.\n' +
-    'Recharge la page pour voir le menu mis à jour.'
+    '✓ Rafraîchissement automatique (Bordereau + Taxonomy) activé toutes les ' +
+    minutes + ' min.\nRecharge la page pour voir le menu mis à jour.'
   );
 }
 
@@ -221,7 +221,10 @@ function disableAutoRefresh() {
 function _removeRefreshTriggers() {
   let removed = 0;
   ScriptApp.getProjectTriggers().forEach(function(t) {
-    if (t.getHandlerFunction() === 'refreshBordereau') {
+    var fn = t.getHandlerFunction();
+    // Remove the current 'refreshAll' triggers AND any legacy
+    // 'refreshBordereau' trigger from before the Taxonomy extension.
+    if (fn === 'refreshAll' || fn === 'refreshBordereau') {
       ScriptApp.deleteTrigger(t);
       removed++;
     }

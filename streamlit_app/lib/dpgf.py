@@ -103,11 +103,17 @@ RECAP_HORS_SST_KEYS = {
     "Rent_hs_kv":           "kv",
 }
 RECAP_PLANNING_KEYS = {
-    "Tps_chantier": "tps_chantier",
-    "Personnes":    "personnes",
-    "Jours":        "jours",
-    "Semaines":     "semaines",
-    "Mois":         "mois",
+    "Tps_chantier":      "tps_chantier",
+    "Personnes":         "personnes",
+    "Jours":             "jours",
+    "Semaines":          "semaines",
+    "Mois":              "mois",
+    # The three planning INPUT cells (B23-B25). Captured too so the project
+    # card can show the full "Temps chantier" block exactly as the sheet does,
+    # and so we keep the assumptions that produced jours / semaines / mois.
+    "Heures_par_jour":   "heures_par_jour",
+    "Jours_par_semaine": "jours_par_semaine",
+    "Semaines_par_mois": "semaines_par_mois",
 }
 
 

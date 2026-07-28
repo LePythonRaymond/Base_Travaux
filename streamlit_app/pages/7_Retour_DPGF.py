@@ -31,6 +31,7 @@ from lib.branding import (
     apply_branding,
     hf_chip,
     hf_dot,
+    hf_kpi,
     hf_stepper,
     render_footer,
     render_header,
@@ -251,55 +252,47 @@ with hdr_r:
 #  Step 1 — Dépôt
 # ============================================================================
 if S["dpgf_step"] == 0:
-    # Hard requirement banner — the parser only understands the
-    # Merci Raymond DPGF template v2. Any other workbook (BTP / Excelya /
-    # ad-hoc client format) will be rejected at upload time.
+    # Hard requirement banner, one line: the parser only understands the Merci
+    # Raymond DPGF template. The detail (expected columns + what the commit
+    # actually does) lives in the expander below, so the landing screen is calm.
     st.markdown(
-        """
-        <div class="hf-card danger" style="margin:4px 0 16px 0">
-          <div class="hf-row" style="gap:10px;align-items:flex-start">
-            <span style="font-size:18px;line-height:1">⚠</span>
-            <div>
-              <div style="font-weight:600;font-size:13.5px;color:var(--hf-ink)">
-                Format requis · classeur DPGF Merci Raymond v2
-              </div>
-              <div class="hf-muted" style="font-size:11.5px;margin-top:4px;line-height:1.55">
-                Le classeur doit contenir un onglet nommé <b>« DPGF »</b>
-                (ou « DPGF Master » / « DPGF Template »). Tu peux téléverser
-                le <b>classeur complet</b> — la page ignorera les autres
-                onglets et lira uniquement le DPGF. Les colonnes attendues
-                sur l'onglet DPGF :
-                <ul style="margin:6px 0 0 18px;padding:0;line-height:1.6">
-                  <li><b>Zone client (A–Z)</b> : <code>B</code>/<code>C</code>/<code>E</code> par défaut pour désignation/unité/quantité — re-mappables via les cellules <code>Col_Designation</code>, <code>Col_Unite</code>, <code>Col_Quantite</code> de l'onglet Paramètres.</li>
-                  <li><b>Notre zone (AA+)</b> : <code>AC</code> = quantité mirroir — <code>AG</code> = chaîne produit (Famille — Sous-cat — Référence — Cond.)</li>
-                  <li><code>AI</code> = fournisseur (résolu par formule) — <code>AQ</code> = prix fourniture / unité (notre coût d'achat)</li>
-                  <li><code>BC</code> = PU unitaire client accepté (ce que le marché a validé)</li>
-                </ul>
-                Un classeur d'un autre format (ex. DPGF client externe non
-                Merci Raymond) sera <b>refusé</b>.
-              </div>
-            </div>
-          </div>
-        </div>
-        """,
+        '<div class="hf-card danger" style="margin:4px 0 10px 0;padding:10px 14px">'
+        '<div class="hf-row" style="gap:9px;align-items:center">'
+        '<span style="font-size:16px;line-height:1">⚠</span>'
+        '<span style="font-weight:600;font-size:13px;color:var(--hf-ink)">'
+        "Format requis · MR DPGF Template (Master)</span>"
+        "</div></div>",
         unsafe_allow_html=True,
     )
 
-    st.markdown(
-        '<p class="hf-muted" style="margin:6px 0 10px 0;font-size:13px;max-width:740px">'
-        "À l'enregistrement, pour chaque ligne le système :"
-        "</p>"
-        '<ul class="hf-muted" style="font-size:12.5px;line-height:1.7;max-width:740px;margin:0 0 14px 18px;padding:0">'
-        "<li>identifie le <b>produit existant</b> correspondant (ou propose d'en créer un nouveau),</li>"
-        "<li>met à jour le <b>coût HT</b> du produit avec le prix fournisseur du modèle (col. AQ) — c'est notre coût d'achat réel,</li>"
-        "<li>enregistre le <b>PU client accepté</b> (col. BC) dans l'historique du produit avec un chip rouge "
-        "<code>dpgf_return</code> — <b>uniquement si</b> ce PU diffère du PU fournisseur de la ligne. "
-        "Quand AQ = BC, la mise à jour de coût suffit ; sinon, on garde trace du prix de vente distinct.</li>"
-        "<li>pour les lignes sans correspondance : crée le produit avec les pièces extraites "
-        "de la chaîne col. AG — si le triplet est incomplet, le produit part en <b>À classifier</b>.</li>"
-        "</ul>",
-        unsafe_allow_html=True,
-    )
+    with st.expander("Comment le fichier est traité", expanded=False):
+        st.markdown(
+            '<p class="hf-muted" style="margin:2px 0 8px 0;font-size:12.5px">'
+            "À l'enregistrement, pour chaque ligne le système :</p>"
+            '<ul class="hf-muted" style="font-size:12.5px;line-height:1.7;margin:0 0 12px 18px;padding:0">'
+            "<li>identifie le <b>produit existant</b> correspondant (ou propose d'en créer un nouveau),</li>"
+            "<li>met à jour le <b>coût HT</b> du produit avec le prix fournisseur du modèle (col. AQ) — c'est notre coût d'achat réel,</li>"
+            "<li>enregistre le <b>PU client accepté</b> (col. BC) dans l'historique du produit avec un chip rouge "
+            "<code>dpgf_return</code> — <b>uniquement si</b> ce PU diffère du PU fournisseur de la ligne. "
+            "Quand AQ = BC, la mise à jour de coût suffit ; sinon, on garde trace du prix de vente distinct.</li>"
+            "<li>pour les lignes sans correspondance : crée le produit avec les pièces extraites "
+            "de la chaîne col. AG — si le triplet est incomplet, le produit part en <b>À classifier</b>.</li>"
+            "</ul>"
+            '<p class="hf-muted" style="margin:0 0 6px 0;font-size:12.5px">'
+            "Le classeur doit contenir un onglet <b>« DPGF »</b> (ou « DPGF Master » / "
+            "« DPGF Template ») ; tu peux téléverser le classeur complet, les autres "
+            "onglets sont ignorés. Colonnes lues :</p>"
+            '<ul class="hf-muted" style="font-size:12px;line-height:1.6;margin:0 0 4px 18px;padding:0">'
+            "<li><b>Zone client (A–Z)</b> : <code>B</code>/<code>C</code>/<code>E</code> par défaut "
+            "(désignation / unité / quantité) — re-mappables via <code>Col_Designation</code>, "
+            "<code>Col_Unite</code>, <code>Col_Quantite</code>.</li>"
+            "<li><b>Notre zone (AA+)</b> : <code>AC</code> quantité mirroir · <code>AG</code> chaîne produit "
+            "(Famille — Sous-cat — Référence — Cond.)</li>"
+            "<li><code>AI</code> fournisseur · <code>AQ</code> prix fourniture / unité · "
+            "<code>BC</code> PU client accepté</li>"
+            "</ul>",
+            unsafe_allow_html=True,
+        )
 
     project_name = st.text_input(
         "Nom du projet",
@@ -855,7 +848,7 @@ elif S["dpgf_step"] == 2:
             ↳ <b>PU client accepté</b> (col. BC) enregistré en <b>rouge</b>
             <code style="font-family:JetBrains Mono,monospace;background:var(--hf-cream);padding:1px 5px;border-radius:3px;font-size:10.5px">dpgf_client_price</code>
             avec le <b>détail des coefficients</b>, rattaché au projet.<br>
-            ↳ Le <b>fichier .xlsx</b> et les <b>stats de rentabilité</b> du projet sont conservés (page Paramètres → Pilotage).<br>
+            ↳ Le <b>fichier .xlsx</b> et les <b>stats de rentabilité</b> du projet sont conservés (voir « Pilotage de rentabilité » en bas de cette page).<br>
             ↳ Les <b>nouveaux produits</b> utilisent la taxonomie / fournisseur / norme précisés à l'étape précédente.
           </div>
         </div>
@@ -1251,13 +1244,354 @@ elif S["dpgf_step"] == 2:
                     f"{n_updated} produit(s) mis à jour · "
                     f"{n_created} produit(s) créé(s) · "
                     f"{n_validated} prix client (rouge) enregistré(s). "
-                    f"Le fichier .xlsx et les stats sont conservés (Paramètres → Pilotage)."
+                    f"Le fichier .xlsx et les stats sont conservés (Pilotage de rentabilité, en bas de cette page)."
                 )
                 st.success(msg)
                 _reset()
                 st.balloons()
             except Exception as exc:
                 st.error(f"Échec de l'enregistrement : {exc}")
+
+
+# ============================================================================
+#  Pilotage de rentabilité — history of every re-ingested project
+# ============================================================================
+# Lives here (not on Paramètres) because it's the natural read-side of this
+# page: you drop a signed DPGF above, and every project you've already sent
+# through is listed below. Only rendered on the landing step so it never
+# clutters the wizard mid-flow.
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _fmt_money(v, decimals: int = 0) -> str:
+    """FR money format: 1 234,56 €. Python emits en-US (1,234.56), so swap both
+    separators — with decimals=0 the '.' branch is simply a no-op."""
+    try:
+        s = f"{float(v):,.{decimals}f}"
+    except (TypeError, ValueError):
+        return "—"
+    return s.replace(",", " ").replace(".", ",") + " €"
+
+
+def _num(v):
+    return float(v) if isinstance(v, (int, float)) else None
+
+
+def _canon(p) -> dict:
+    """Authoritative rentability for a project: the SHEET recap when present
+    (ground truth), else the app's computed line-sum (older imports). recap
+    may also carry hors_sst + the Tps-chantier planning fields."""
+    recap = p["recap"] or {}
+    if _num(recap.get("prix_vente")) is not None:
+        return recap
+    return p["stats"] or {}
+
+
+@st.cache_data(show_spinner=False, max_entries=20, ttl=3600)
+def _project_xlsx(pid: int) -> bytes | None:
+    """Lazily load (and cache) the stored .xlsx for one project.
+
+    Bounded cache: these are raw workbook blobs and the list renders up to 100
+    projects per rerun — unbounded caching would pin every file in memory."""
+    row = fetch_one("SELECT file_bytes FROM dpgf_projects WHERE id = :id", {"id": pid})
+    if not row or row["file_bytes"] is None:
+        return None
+    return bytes(row["file_bytes"])
+
+
+def _detail_fmt(value, kind: str) -> str:
+    """Format one recap value the way the sheet does (FR decimal comma)."""
+    v = _num(value)
+    if v is None:
+        return "—"
+    if kind == "€":
+        return _fmt_money(v, 2)
+    if kind == "%":
+        return f"{v:.2f} %".replace(".", ",")
+    if kind == "kv":
+        return f"{v:.3f}".replace(".", ",")
+    if kind == "h":
+        return f"{v:.0f} h"
+    # plain number: drop the decimals when it's whole (5 not 5,0)
+    return (f"{v:.0f}" if abs(v - round(v)) < 1e-9 else f"{v:.2f}".replace(".", ","))
+
+
+def _detail_block(title: str, rows: list) -> str:
+    """One green-banded label/value block, mirroring the sheet's recap cards."""
+    body = "".join(
+        '<div class="hf-row" style="justify-content:space-between;gap:10px;'
+        'padding:3px 8px;border-bottom:1px solid var(--hf-border-soft)">'
+        f'<span class="hf-muted" style="font-size:11px">{label}</span>'
+        f'<span style="font-size:11.5px;font-weight:600;color:var(--hf-ink)">'
+        f'{_detail_fmt(value, kind)}</span></div>'
+        for label, value, kind in rows
+    )
+    return (
+        '<div style="border:1px solid var(--hf-border-soft);border-radius:6px;overflow:hidden">'
+        '<div style="background:var(--hf-accent);color:#fff;font-weight:700;'
+        'font-size:10.5px;padding:4px 8px;letter-spacing:.02em">' + title + "</div>"
+        + body + "</div>"
+    )
+
+
+def _render_rentabilite() -> None:
+    st.markdown('<div style="height:22px"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<h2 class="hf-h2" style="margin:6px 0 2px 0">Pilotage de rentabilité</h2>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<p class="hf-muted" style="font-size:12.5px;margin:0 0 12px 0;max-width:780px">'
+        "Chaque DPGF re-ingéré (signé) est conservé ici — le fichier et sa rentabilité. "
+        "Les chiffres viennent de la <b>feuille « Pilotage de rentabilité » du DPGF</b> "
+        "(source de vérité — c'est là que Vincent gère prix, coefficients et marges) ; "
+        "le calcul interne de l'app ne sert que de contre-vérification "
+        "(badge <b>≠ calcul</b> en cas d'écart). Les imports plus anciens, sans bloc "
+        "rentabilité, retombent sur le calcul interne (badge <i>calculé</i>).</p>",
+        unsafe_allow_html=True,
+    )
+
+    projects = fetch_all(
+        """
+        SELECT id, project_name, filename, imported_at, imported_by,
+               n_lines, n_matched, n_created,
+               stats, recap, coefficients,
+               octet_length(file_bytes) AS file_size
+          FROM dpgf_projects
+         ORDER BY imported_at DESC
+         LIMIT 100
+        """
+    )
+
+    if not projects:
+        st.markdown(
+            '<div class="hf-card" style="padding:18px 20px">'
+            '<div class="hf-muted" style="font-size:12.5px">'
+            "Aucun projet ingéré pour l'instant. Dépose un DPGF signé ci-dessus — "
+            "il apparaîtra ici avec ses statistiques de rentabilité "
+            "et le fichier téléchargeable.</div></div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Aggregate KPI strip (driven by the authoritative sheet recap) ──
+    _canons = [_canon(p) for p in projects]
+    tot_pv = sum(_num(c.get("prix_vente")) or 0 for c in _canons)
+    tot_pr = sum(_num(c.get("prix_revient")) or 0 for c in _canons)
+    tot_marge = tot_pv - tot_pr
+    marge_pct = (tot_marge / tot_pv * 100) if tot_pv else None
+    kv_moyen = (tot_pv / tot_pr) if tot_pr else None
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        hf_kpi("Projets", len(projects))
+    with k2:
+        hf_kpi("Prix de vente cumulé", _fmt_money(tot_pv))
+    with k3:
+        hf_kpi("Prix de revient cumulé", _fmt_money(tot_pr))
+    with k4:
+        hf_kpi("Marge moyenne", f"{marge_pct:.1f}".replace(".", ",") if marge_pct is not None else "—", unit="%")
+    with k5:
+        hf_kpi("KV moyen", f"{kv_moyen:.3f}".replace(".", ",") if kv_moyen is not None else "—", accent=True)
+
+    st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)
+
+    # ── Per-project cards ──
+    for p in projects:
+        stats = p["stats"] or {}
+        recap = p["recap"] or {}
+        canon = _canon(p)
+        from_sheet = canon is recap and bool(recap)
+        pv = _num(canon.get("prix_vente"))
+        pr = _num(canon.get("prix_revient"))
+        marge_e = _num(canon.get("marge_eur"))
+        marge_p = _num(canon.get("marge_pct"))
+        kv = _num(canon.get("kv"))
+
+        # Provenance + cross-check: the sheet figure is shown; flag when the
+        # app's line-sum (stats) disagrees with it by >1 %.
+        src_chip = hf_chip("feuille", "ok") if from_sheet else hf_chip("calculé", "ghost")
+        cross_flag = ""
+        if from_sheet:
+            sheet_pv, comp_pv = _num(recap.get("prix_vente")), _num(stats.get("prix_vente"))
+            if sheet_pv and comp_pv and abs(sheet_pv - comp_pv) > max(1.0, 0.01 * sheet_pv):
+                cross_flag = hf_chip("≠ calcul", "warn")
+
+        # Hors-SST variant (full block from the sheet recap).
+        hors = canon.get("hors_sst") if isinstance(canon.get("hors_sst"), dict) else None
+        hors_html = ""
+        if hors:
+            bits = []
+            h_pv, h_pr, h_marge = _num(hors.get("prix_vente")), _num(hors.get("prix_revient")), _num(hors.get("marge_eur"))
+            h_pct, h_kv = _num(hors.get("marge_pct")), _num(hors.get("kv"))
+            if h_pv is not None:
+                bits.append(f"PV {_fmt_money(h_pv)}")
+            if h_pr is not None:
+                bits.append(f"PR {_fmt_money(h_pr)}")
+            if h_marge is not None:
+                bits.append(f"marge {_fmt_money(h_marge)}")
+            if h_pct is not None:
+                bits.append(f"{h_pct:.1f}%".replace(".", ","))
+            if h_kv is not None:
+                bits.append(f"KV {h_kv:.3f}".replace(".", ","))
+            if bits:
+                hors_html = (
+                    '<div class="hf-muted" style="font-size:10.5px;margin-top:6px;'
+                    'padding-top:6px;border-top:1px dashed var(--hf-border-soft)">'
+                    "Hors-SST · " + " · ".join(bits) + "</div>"
+                )
+
+        # Tps-chantier planning line (only present on sheet-recap projects).
+        plan_bits = []
+        for key, label, fmt in [
+            ("tps_chantier", "Tps chantier", "{:.0f} h"), ("personnes", "Pers.", "{:.0f}"),
+            ("jours", "Jours", "{:.0f}"), ("semaines", "Sem.", "{:.1f}"), ("mois", "Mois", "{:.1f}"),
+        ]:
+            v = _num(canon.get(key))
+            if v is not None:
+                plan_bits.append(f"{label} {fmt.format(v)}".replace(".", ","))
+        plan_html = (
+            '<div class="hf-muted" style="font-size:10.5px;margin-top:4px">'
+            "Planning · " + " · ".join(plan_bits) + "</div>"
+        ) if plan_bits else ""
+
+        when = ""
+        try:
+            when = p["imported_at"].strftime("%d/%m/%Y")
+        except Exception:  # noqa: BLE001
+            pass
+        size_kb = f"{(p['file_size'] or 0) / 1024:.0f} Ko"
+
+        with st.container(border=True):
+            c_meta, c_pv, c_pr, c_marge, c_kv, c_dl = st.columns([3, 1.5, 1.5, 1.7, 1, 1.4])
+            with c_meta:
+                st.markdown(
+                    f'<div style="font-weight:600;font-size:13.5px;color:var(--hf-ink)">'
+                    f'{(p["project_name"] or "Projet sans nom")}</div>'
+                    f'<div class="hf-row" style="gap:5px;align-items:center;margin-top:3px">'
+                    f'<span class="hf-muted" style="font-size:10.5px">'
+                    f'{when} · {p["n_lines"]} lignes · {p["n_matched"]}✓ / {p["n_created"]}＋</span>'
+                    f'{src_chip}{cross_flag}</div>'
+                    f'{hors_html}{plan_html}',
+                    unsafe_allow_html=True,
+                )
+            with c_pv:
+                st.markdown(
+                    '<div class="hf-muted" style="font-size:9.5px">Prix de vente</div>'
+                    f'<div style="font-weight:600;font-size:15px;color:var(--hf-ink)">{_fmt_money(pv)}</div>',
+                    unsafe_allow_html=True,
+                )
+            with c_pr:
+                st.markdown(
+                    '<div class="hf-muted" style="font-size:9.5px">Prix de revient</div>'
+                    f'<div style="font-weight:600;font-size:15px;color:var(--hf-ink)">{_fmt_money(pr)}</div>',
+                    unsafe_allow_html=True,
+                )
+            with c_marge:
+                pct_txt = f' · {marge_p:.1f}%'.replace(".", ",") if marge_p is not None else ""
+                st.markdown(
+                    '<div class="hf-muted" style="font-size:9.5px">Marge</div>'
+                    f'<div style="font-weight:600;font-size:15px;color:var(--hf-ink)">{_fmt_money(marge_e)}'
+                    f'<span style="font-size:11px;color:var(--hf-muted);font-weight:500">{pct_txt}</span></div>',
+                    unsafe_allow_html=True,
+                )
+            with c_kv:
+                st.markdown(
+                    '<div class="hf-muted" style="font-size:9.5px">KV</div>'
+                    f'<div style="font-weight:700;font-size:15px;color:var(--hf-accent)">'
+                    f'{f"{kv:.3f}".replace(".", ",") if kv is not None else "—"}</div>',
+                    unsafe_allow_html=True,
+                )
+            with c_dl:
+                data = _project_xlsx(p["id"])
+                if data:
+                    st.download_button(
+                        "⬇ .xlsx",
+                        data=data,
+                        file_name=p["filename"] or f"projet_{p['id']}.xlsx",
+                        mime=_XLSX_MIME,
+                        key=f"rent_dl_{p['id']}",
+                        use_container_width=True,
+                        help=f"{size_kb} · fichier d'origine conservé",
+                    )
+                else:
+                    st.markdown(
+                        '<span class="hf-muted" style="font-size:10px">fichier absent</span>',
+                        unsafe_allow_html=True,
+                    )
+
+            # ── Full detail — mirrors the three blocks of the sheet's
+            #    « Pilotage de rentabilité » tab, plus the coefficient snapshot.
+            with st.expander("Détail du projet", expanded=False):
+                d1, d2, d3 = st.columns(3)
+                with d1:
+                    st.markdown(
+                        _detail_block("TEMPS CHANTIER", [
+                            ("Tps chantier", canon.get("tps_chantier"), "h"),
+                            ("Personnes (équipe)", canon.get("personnes"), ""),
+                            ("Heures / jour", canon.get("heures_par_jour"), ""),
+                            ("Jours / semaine", canon.get("jours_par_semaine"), ""),
+                            ("Semaines / mois", canon.get("semaines_par_mois"), ""),
+                            ("Jours", canon.get("jours"), ""),
+                            ("Semaines", canon.get("semaines"), ""),
+                            ("Mois", canon.get("mois"), ""),
+                        ]),
+                        unsafe_allow_html=True,
+                    )
+                with d2:
+                    st.markdown(
+                        _detail_block("RENTABILITÉ — GLOBAL", [
+                            ("Prix de vente", canon.get("prix_vente"), "€"),
+                            ("Prix de revient", canon.get("prix_revient"), "€"),
+                            ("Marge €", canon.get("marge_eur"), "€"),
+                            ("Marge %", canon.get("marge_pct"), "%"),
+                            ("KV (vente / revient)", canon.get("kv"), "kv"),
+                        ]),
+                        unsafe_allow_html=True,
+                    )
+                with d3:
+                    hs = hors or {}
+                    st.markdown(
+                        _detail_block("RENTABILITÉ — HORS SST", [
+                            ("Prix de vente", hs.get("prix_vente"), "€"),
+                            ("Prix de revient", hs.get("prix_revient"), "€"),
+                            ("Marge €", hs.get("marge_eur"), "€"),
+                            ("Marge %", hs.get("marge_pct"), "%"),
+                            ("KV (vente / revient)", hs.get("kv"), "kv"),
+                        ]),
+                        unsafe_allow_html=True,
+                    )
+
+                # Ingestion counters + coefficient snapshot used for this quote.
+                coefs = p["coefficients"] or {}
+                meta_bits = [
+                    f"{p['n_lines']} lignes",
+                    f"{p['n_matched']} produits mis à jour",
+                    f"{p['n_created']} produits créés",
+                ]
+                if p.get("imported_by"):
+                    meta_bits.append(f"par {p['imported_by']}")
+                if p.get("filename"):
+                    meta_bits.append(str(p["filename"]))
+                st.markdown(
+                    '<div class="hf-muted" style="font-size:11px;margin-top:10px">'
+                    + " · ".join(meta_bits) + "</div>",
+                    unsafe_allow_html=True,
+                )
+                if coefs:
+                    coef_bits = [
+                        f"<code>{k}</code> {str(v).replace('.', ',')}"
+                        for k, v in sorted(coefs.items())
+                    ]
+                    st.markdown(
+                        '<div class="hf-muted" style="font-size:11px;margin-top:6px;line-height:1.8">'
+                        "<b>Coefficients appliqués</b> · " + " · ".join(coef_bits) + "</div>",
+                        unsafe_allow_html=True,
+                    )
+
+
+if S["dpgf_step"] == 0:
+    _render_rentabilite()
 
 
 render_footer()

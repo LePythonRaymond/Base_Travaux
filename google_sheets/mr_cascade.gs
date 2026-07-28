@@ -27,11 +27,17 @@
 const DPGF_SHEET = 'DPGF';
 const BORDEREAU_SHEET = 'Bordereau';
 const TAXONOMY_SHEET = 'Taxonomy';
+const HELPERS_SHEET = 'Helpers';
 const DATA_FIRST_ROW = 3;
 const COL_AD = 30;  // Famille
 const COL_AE = 31;  // Sous-catégorie
 const COL_AF = 32;  // Conditionnement
 const COL_AG = 33;  // Produit
+const COL_AI = 35;  // Fournisseur — auto-filled by lookup, but ALSO carries a
+                    // dropdown of known suppliers (allowInvalid → a brand-new
+                    // name can be typed). Picking a value overwrites that row's
+                    // formula; that row is then a manual override.
+const HELPERS_SUPPLIER_COL = 'I';  // Helpers!I = unique supplier list (A..G taken)
 // COL_BE (57) = hidden stable product-id column. It's a passive lookup
 // formula (=INDEX(Bordereau!A.., MATCH(AG.., Helpers!A.., 0))) the cascade
 // doesn't touch — see google_sheets/CELL_FORMULAS.md §3. Reverse-ingestion
@@ -581,6 +587,41 @@ function _getParamsSheet_(ss) {
  * the value cell (col B) is empty, a default value. Used for the rentability
  * INPUT cells so a re-run never clobbers Vincent's tuned Personnes / heures.
  */
+/**
+ * Supplier column (AI): keep the automatic lookup AND offer a dropdown.
+ *
+ * The AI cells hold a PER-ROW formula that resolves the supplier of the picked
+ * product, so by default the column self-fills. On top of that we attach a
+ * data-validation dropdown listing every known supplier. Clicking a cell shows
+ * the list; choosing a value REPLACES that row's formula (that row becomes a
+ * manual override), which is exactly the "auto-fill + dropdown" behaviour.
+ * `allowInvalid(true)` means a brand-new supplier can simply be typed in.
+ *
+ * The option list is a unique, sorted view of the Bordereau's supplier column
+ * (L), parked in Helpers!I — so it tracks the live DB with no extra endpoint.
+ *
+ * NOTE: re-running the installer rewrites the AI formulas, which clears manual
+ * overrides. Vincent should re-pick after a full refresh (or we move to a
+ * dedicated override column if that proves annoying in practice).
+ */
+function _applySupplierDropdown_(ss, dpgf, first, last) {
+  const helpers = ss.getSheetByName(HELPERS_SHEET);
+  if (!helpers) return;
+  const col = HELPERS_SUPPLIER_COL;
+  helpers.getRange(col + '1').setValue('fournisseurs (liste)');
+  helpers.getRange(col + '2').setFormula(_formulaForLocale(
+    '=IFERROR(SORT(UNIQUE(FILTER(Bordereau!L2:L501, Bordereau!L2:L501<>""))), "")'
+  ));
+  SpreadsheetApp.flush();   // let the list materialise before binding validation
+  const rule = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(helpers.getRange(col + '2:' + col + '300'), true)
+      .setAllowInvalid(true)   // a supplier we don't know yet can still be typed
+      .setHelpText('Choisis un fournisseur connu, ou tape un nouveau nom.')
+      .build();
+  dpgf.getRange(first, COL_AI, last - first + 1, 1).setDataValidation(rule);
+}
+
+
 function _setIfBlank_(sh, row, ident, defVal, label) {
   sh.getRange(row, 1).setValue(label);
   sh.getRange(row, 3).setValue(ident);
@@ -627,6 +668,9 @@ function applyRentabilite() {
   }
   dpgf.getRange(FIRST, COL_BE, LAST - FIRST + 1, 1).setFormulas(beFormulas);
   dpgf.hideColumns(COL_BE);
+
+  // --- B1b. Supplier dropdown on AI (keeps the auto-fill formula) --
+  _applySupplierDropdown_(ss, dpgf, FIRST, LAST);
 
   // --- B2. Wide free-text "Commentaire" column (BF) ---------------
   // Open notes per line / section, in the yellow input colour so it reads
@@ -682,6 +726,27 @@ function applyRentabilite() {
     params.getRange(t[0], 1).setValue(t[1]).setFontColor('#3A3A3A').setFontWeight('normal');
     params.getRange(t[0], 3).setValue(t[2]);
   });
+
+  // --- C2. Named ranges for the recap cells (workbook scope) ------
+  // MUST run BEFORE the formulas in D. Removing a named range makes Sheets
+  // rewrite every formula that referenced it into a literal #REF! — and
+  // re-creating the name afterwards does NOT heal those formulas. Defining the
+  // names first means D writes formulas against names that already resolve.
+  const RENT_NAMED = [
+    ['Tps_chantier','B21'], ['Personnes','B22'], ['Heures_par_jour','B23'],
+    ['Jours_par_semaine','B24'], ['Semaines_par_mois','B25'],
+    ['Jours','B26'], ['Semaines','B27'],
+    ['Rent_prix_vente','B31'], ['Rent_prix_revient','B32'], ['Rent_marge_eur','B33'],
+    ['Rent_hs_prix_vente','B38'], ['Rent_hs_prix_revient','B39'], ['Rent_hs_marge_eur','B40'],
+  ];
+  const want = {};
+  RENT_NAMED.forEach(function(p) { want[p[0]] = 1; });
+  ss.getNamedRanges().forEach(function(nr) {
+    var n = nr.getName(); var b = n.lastIndexOf('!'); if (b >= 0) n = n.substring(b + 1);
+    if (want[n]) nr.remove();
+  });
+  RENT_NAMED.forEach(function(p) { ss.setNamedRange(p[0], params.getRange(p[1])); });
+  SpreadsheetApp.flush();   // names must be live before D writes formulas
 
   // --- D. Recap formulas (always rewrite, locale-safe) ------------
   const FORMULAS = [
@@ -744,21 +809,7 @@ function applyRentabilite() {
       params.setRowHeight(h[0], 24);
     });
 
-  // --- F. Named ranges for the recap cells (workbook scope) -------
-  const RENT_NAMED = [
-    ['Tps_chantier','B21'], ['Personnes','B22'], ['Heures_par_jour','B23'],
-    ['Jours_par_semaine','B24'], ['Semaines_par_mois','B25'],
-    ['Jours','B26'], ['Semaines','B27'],
-    ['Rent_prix_vente','B31'], ['Rent_prix_revient','B32'], ['Rent_marge_eur','B33'],
-    ['Rent_hs_prix_vente','B38'], ['Rent_hs_prix_revient','B39'], ['Rent_hs_marge_eur','B40'],
-  ];
-  const want = {};
-  RENT_NAMED.forEach(function(p) { want[p[0]] = 1; });
-  ss.getNamedRanges().forEach(function(nr) {
-    var n = nr.getName(); var b = n.lastIndexOf('!'); if (b >= 0) n = n.substring(b + 1);
-    if (want[n]) nr.remove();
-  });
-  RENT_NAMED.forEach(function(p) { ss.setNamedRange(p[0], params.getRange(p[1])); });
+  // (Named ranges are defined in C2, BEFORE the formulas — see the note there.)
 
   SpreadsheetApp.getActive().toast('Bloc rentabilité installé sur « Pilotage de rentabilité ».', 'OK', 5);
 }
