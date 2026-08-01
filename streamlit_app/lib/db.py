@@ -18,7 +18,6 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 import pandas as pd
-import streamlit as st
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.engine import Connection
 
@@ -34,19 +33,26 @@ VALID_SOURCES = {
 }
 
 
-@st.cache_resource(show_spinner=False)
+_ENGINE: Engine | None = None
+
+
 def get_engine() -> Engine:
     """Return a process-wide SQLAlchemy engine.
 
-    Streamlit reruns the script per interaction, so we cache the engine in
-    the resource cache to avoid building a new pool every rerun.
+    A module-level singleton rather than `@st.cache_resource`: modules persist
+    across Streamlit reruns anyway, and this keeps `lib.db` importable from a
+    HEADLESS process (the background ingestion worker) that has no Streamlit
+    script context.
     """
-    return create_engine(
-        os.environ["DATABASE_URL"],
-        pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=5,
-    )
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = create_engine(
+            os.environ["DATABASE_URL"],
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=5,
+        )
+    return _ENGINE
 
 
 @contextmanager

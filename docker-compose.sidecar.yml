@@ -76,6 +76,29 @@ services:
       # enough. (Re-add a traefik basicauth middleware here if you ever want the
       # extra browser-prompt layer back.)
 
+  # Background invoice-ingestion worker. Same image as the app, different
+  # command: it consumes `ingestion_jobs` so a scan survives the user closing
+  # the browser tab (Streamlit itself is synchronous and would kill the run).
+  # Not exposed to Traefik — no HTTP surface at all.
+  worker:
+    build: ./streamlit_app
+    command: ["python", "-u", "worker.py"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      INVOICE_DIR: /data/invoices
+      WORKER_POLL_SECONDS: "5"
+      WORKER_PACE_SECONDS: "2"
+    volumes:
+      - mr_invoices_data:/data/invoices   # same volume as the app: it reads the PDFs
+    networks: [mrnet]                     # DB only — never on the proxy network
+    labels:
+      - traefik.enable=false
+
   bordereau_api:
     build: ./bordereau_api
     restart: unless-stopped

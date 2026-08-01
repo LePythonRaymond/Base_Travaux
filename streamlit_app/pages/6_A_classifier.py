@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timezone
 
@@ -38,6 +39,8 @@ from lib.pickers import (
 
 UNIT_TYPES = ["u", "m3", "ml", "m2", "Ft", "kg", "l"]
 NEW_VALUE_SENTINEL = "+ Créer nouveau…"
+
+log = logging.getLogger(__name__)
 
 st.set_page_config(page_title="À classifier — Merci Raymond", page_icon="🌳", layout="wide")
 require_login()
@@ -521,23 +524,94 @@ with tab_needs_info:
             """
         )
 
-        # ── Bulk action: reject everything still pending in one click.
-        #    (Bulk APPROVE stays deliberately absent — approving inserts into
-        #    the live catalogue and each row usually needs a human to fix the
-        #    unit / family first. Rejecting is safe and reversible in spirit:
-        #    the rows keep their data with status='rejected'.)
+        # ── Bulk actions: two plain buttons, one click each.
+        #    « Tout accepter » inserts every pending line with its best-guess
+        #    values; anything unresolved lands in the À-classifier bucket
+        #    (subcategory/packaging = 'À classifier', supplier = Fournisseur
+        #    inconnu, norme par défaut) rather than blocking the batch. Lines
+        #    without a usable cost can't satisfy the NOT NULL cost_ht and are
+        #    reported as skipped.
         if queue_rows:
-            ba1, ba2 = st.columns([3, 1.4])
+            ba1, ba2, _ba3 = st.columns([1.6, 1.6, 3])
             with ba1:
-                confirm_bulk = st.checkbox(
-                    f"Je confirme vouloir rejeter les {len(queue_rows)} lignes en attente",
-                    key="qni_bulk_confirm",
-                )
+                if st.button(
+                    f"✓ Tout accepter ({len(queue_rows)})",
+                    key="qni_bulk_accept",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    actor = os.environ.get("STREAMLIT_AUTH_USER", "system")
+                    inserted = skipped = 0
+                    fam_by_name = {
+                        r["name"].strip().lower(): r["id"]
+                        for r in fetch_all("SELECT id, name FROM product_families")
+                    }
+                    ph_sup = fetch_one(
+                        "SELECT id FROM suppliers WHERE name = 'Fournisseur inconnu' LIMIT 1")
+                    ph_norm = fetch_one(
+                        "SELECT id FROM labor_norms WHERE task_name = "
+                        "'Norme par défaut (à classifier)' LIMIT 1")
+                    for q in queue_rows:
+                        cost = q.get("candidate_cost_ht")
+                        ref = (q.get("candidate_reference_name") or "").strip()
+                        fid = fam_by_name.get((q.get("candidate_family_hint") or "").strip().lower())
+                        sup = q.get("candidate_supplier_id") or (ph_sup and ph_sup["id"])
+                        lid = q.get("candidate_labor_norm_id") or (ph_norm and ph_norm["id"])
+                        if not ref or cost is None or float(cost) <= 0 or not fid or not sup or not lid:
+                            skipped += 1
+                            continue
+                        pkg = (q.get("candidate_packaging") or "À classifier").strip() or "À classifier"
+                        unit = (q.get("candidate_unit_type") or "u").strip() or "u"
+                        try:
+                            with transaction(ingestion_source=q["source"], ingestion_actor=actor) as conn:
+                                _ensure_taxonomy_row(conn, fid, "À classifier", pkg)
+                                res = conn.execute(
+                                    text(
+                                        """
+                                        INSERT INTO products
+                                            (reference_name, family_id, subcategory, supplier_id,
+                                             labor_norm_id, packaging, unit_type, cost_ht)
+                                        VALUES (:ref, :fid, 'À classifier', :sup, :ln, :pkg, :unit, :cost)
+                                        ON CONFLICT (reference_name, packaging, supplier_id)
+                                          DO UPDATE SET cost_ht = EXCLUDED.cost_ht
+                                        RETURNING id, (xmax = 0) AS is_insert
+                                        """
+                                    ),
+                                    {"ref": ref, "fid": fid, "sup": sup, "ln": lid,
+                                     "pkg": pkg, "unit": unit, "cost": float(cost)},
+                                ).first()
+                                if res[1]:
+                                    conn.execute(
+                                        text(
+                                            "INSERT INTO price_history (product_id, cost_ht, source, "
+                                            "source_reference, recorded_by) "
+                                            "VALUES (:pid,:cost,:src,:ref,:by)"
+                                        ),
+                                        {"pid": int(res[0]), "cost": float(cost), "src": q["source"],
+                                         "ref": q["source_reference"], "by": actor},
+                                    )
+                                conn.execute(
+                                    text(
+                                        "UPDATE ingestion_queue SET status='approved', reviewed_at=now(), "
+                                        "reviewed_by=:by, matched_product_id=:pid WHERE id=:id"
+                                    ),
+                                    {"by": actor, "pid": int(res[0]), "id": q["id"]},
+                                )
+                            inserted += 1
+                        except Exception as exc:  # noqa: BLE001 — one bad row must not stop the batch
+                            log.warning("bulk accept failed on queue %s: %s", q["id"], exc)
+                            skipped += 1
+                    st.success(
+                        f"{inserted} produit(s) insérés — sous-catégorie « À classifier » "
+                        "à affiner dans l'onglet Produits à reclasser."
+                        + (f" {skipped} ligne(s) sans données suffisantes, laissées en attente."
+                           if skipped else "")
+                    )
+                    st.rerun()
             with ba2:
                 if st.button(
                     f"⛔ Tout rejeter ({len(queue_rows)})",
                     key="qni_bulk_reject",
-                    disabled=not confirm_bulk,
                     use_container_width=True,
                 ):
                     actor = os.environ.get("STREAMLIT_AUTH_USER", "system")

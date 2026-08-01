@@ -21,6 +21,7 @@ import os
 import time
 import uuid
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,12 @@ from lib.pickers import (
     resolve_family,
 )
 from lib.gemini import extract_invoice
+from lib.ingestion_core import (
+    enqueue_job,
+    job_counts,
+    recent_jobs,
+    save_pdf_bytes,
+)
 from lib.matcher import find_similar_lines, match
 from lib.schemas import ExtractedInvoice, ExtractionError
 
@@ -201,6 +208,89 @@ def _render_pdf_preview(pdf_bytes: bytes) -> None:
         st.warning(f"Aperçu impossible : {exc}")
 
 
+def _render_jobs_panel() -> None:
+    """Progress of the background worker — the reason a scan survives a tab close.
+
+    Rendered on the upload screen. Auto-refreshes while anything is in flight so
+    the user sees jobs move queued → running → done without touching anything.
+    """
+    jobs = recent_jobs(limit=15)
+    if not jobs:
+        return
+    counts = job_counts()
+    n_active = counts.get("queued", 0) + counts.get("running", 0)
+
+    st.markdown('<div style="height:14px"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<h2 class="hf-h2" style="margin:0 0 2px 0">Traitements en arrière-plan</h2>'
+        '<p class="hf-muted" style="font-size:12px;margin:0 0 8px 0">'
+        "L'analyse tourne côté serveur : tu peux fermer l'onglet, elle continue. "
+        "Les lignes extraites arrivent sur <b>À classifier → Ingestion en attente</b>.</p>",
+        unsafe_allow_html=True,
+    )
+    if n_active:
+        n_q = counts.get("queued", 0)
+        n_r = counts.get("running", 0)
+        chip_q = hf_chip(f"⏳ {n_q} en attente", "warn")
+        chip_r = hf_chip(f"⚙ {n_r} en cours", "ok")
+        st.markdown(
+            '<div class="hf-row" style="gap:8px;margin-bottom:8px">'
+            + chip_q + chip_r + "</div>",
+            unsafe_allow_html=True,
+        )
+
+    _ICON = {"queued": "⏳", "running": "⚙", "done": "✅", "failed": "⛔"}
+    for j in jobs:
+        when = j["created_at"].strftime("%d/%m %H:%M") if j.get("created_at") else "—"
+        detail = ""
+        if j["status"] == "done":
+            detail = f"{j['n_lines'] or 0} ligne(s) en file d'attente"
+        elif j["status"] == "failed":
+            detail = f"<span style='color:var(--hf-terra)'>{(j.get('error') or '')[:120]}</span>"
+        elif j["status"] == "running":
+            detail = "analyse Gemini en cours…"
+        else:
+            detail = "en attente d'un worker"
+        st.markdown(
+            f'<div class="hf-row hf-between" style="font-size:11.5px;padding:4px 8px;'
+            f'border-bottom:1px solid var(--hf-border-soft)">'
+            f'<span>{_ICON.get(j["status"], "•")} <b>{(j["filename"] or "")[:46]}</b>'
+            f'<span class="hf-muted"> · {when}</span></span>'
+            f'<span class="hf-muted">{detail}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    if n_active:
+        # Cheap poll: rerun every 4s only while work is in flight.
+        time.sleep(4)
+        st.rerun()
+
+
+@st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
+def _render_invoice_pages(pdf_bytes: bytes, dpi: int = 110, max_pages: int = 25) -> list[bytes]:
+    """Render EVERY page of the invoice to PNG, for the side-by-side review.
+
+    Cached on the PDF bytes so flipping between lines never re-rasterises.
+    Bounded (max_entries/ttl) because these are full-page images.
+    """
+    pages: list[bytes] = []
+    try:
+        doc = pdfium.PdfDocument(pdf_bytes)
+        try:
+            for i, page in enumerate(doc):
+                if i >= max_pages:
+                    break
+                buf = io.BytesIO()
+                page.render(scale=dpi / 72.0).to_pil().save(buf, format="PNG")
+                pages.append(buf.getvalue())
+        finally:
+            doc.close()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Invoice page rendering failed: %s", exc)
+        return []
+    return pages
+
+
 def _persist_extraction(
     extracted: ExtractedInvoice,
     *,
@@ -316,36 +406,33 @@ if S["ing_step"] == "upload":
             "(page <b>À classifier → Ingestion en attente</b>) pour relecture.</p>",
             unsafe_allow_html=True,
         )
-        if st.button(f"Analyser les {len(batch_files)} PDF", type="primary"):
-            labor_norms = fetch_all("SELECT task_name FROM labor_norms ORDER BY task_name")
-            families = fetch_all("SELECT id, name FROM product_families ORDER BY name")
-            prog = st.progress(0.0)
-            report: list[str] = []
-            for i, (fname, fraw) in enumerate(batch_files):
-                prog.progress(i / len(batch_files), text=f"{fname} ({i + 1}/{len(batch_files)})")
+        if st.button(f"Lancer l'analyse des {len(batch_files)} PDF", type="primary"):
+            # Producer side: save each PDF and queue a job. The `worker`
+            # container does the Gemini work, so this returns instantly and the
+            # user can close the tab / change page without losing anything.
+            batch_label = f"lot {datetime.now().strftime('%d/%m %H:%M')}"
+            actor = os.environ.get("STREAMLIT_AUTH_USER", "system")
+            queued = skipped = 0
+            for fname, fraw in batch_files:
                 fsha = hashlib.sha256(fraw).hexdigest()
                 if _check_duplicate(fsha):
-                    report.append(f"⏭ {fname} — déjà ingéré, sauté")
+                    skipped += 1
                     continue
-                try:
-                    fpath, _ = _save_pdf_bytes(fname, fraw)
-                    extracted_b = extract_invoice(
-                        fraw,
-                        labor_norm_names=[ln["task_name"] for ln in labor_norms],
-                        family_names=[f["name"] for f in families],
-                    )
-                    qids = _persist_extraction(extracted_b, file_path=fpath, file_hash=fsha)
-                    report.append(f"✓ {fname} — {len(qids)} ligne(s) en file d'attente")
-                except Exception as exc:  # noqa: BLE001 — a bad file must not kill the batch
-                    report.append(f"✗ {fname} — échec : {type(exc).__name__}: {str(exc)[:140]}")
-                # Small pause between Gemini calls to stay clear of rate limits.
-                time.sleep(2)
-            prog.progress(1.0, text="Terminé")
-            ok = sum(1 for r in report if r.startswith("✓"))
-            st.success(f"Lot terminé : {ok}/{len(batch_files)} PDF analysés.")
-            for r in report:
-                st.markdown(f"- {r}")
-            st.info("Relecture et validation : page **À classifier → Ingestion en attente**.")
+                fpath, _ = save_pdf_bytes(fname, fraw)
+                enqueue_job(
+                    filename=fname, file_path=fpath, file_sha256=fsha,
+                    submitted_by=actor, batch_label=batch_label,
+                )
+                queued += 1
+            st.success(
+                f"{queued} PDF mis en file de traitement — l'analyse tourne côté serveur. "
+                "Tu peux fermer cet onglet, changer de page : le travail continue."
+                + (f" ({skipped} déjà ingérés, sautés.)" if skipped else "")
+            )
+            st.info("Suis l'avancement ci-dessous, puis relis sur **À classifier → Ingestion en attente**.")
+            st.rerun()
+
+        _render_jobs_panel()
         st.stop()
 
     uploaded = uploads[0] if len(batch_files) == 1 and uploads and not uploads[0].name.lower().endswith(".zip") else None
@@ -508,6 +595,9 @@ if S["ing_step"] == "upload":
                 S["active_line_idx"] = 0
                 st.rerun()
 
+    # Always show what the worker is chewing on, even on the single-file screen.
+    _render_jobs_panel()
+
 
 # ============================================================================
 #  Step C — Review  (hi-fi two-column layout)
@@ -518,7 +608,16 @@ if S["ing_step"] == "review":
     match_results = S["ing_match_results"]
     lines_state = S["ing_lines_state"]
     line_items_raw = extracted["line_items"]
-    n_lines = len(line_items_raw)
+    # Non-product lines (totaux, TVA, remises, en-têtes) are already auto-
+    # rejected in the queue by _persist_extraction — showing them in the
+    # relecture is pure noise. Keep the FULL arrays (commit logic indexes into
+    # them) but drive every UI surface from `visible_idx`.
+    visible_idx = [
+        _i for _i, _li in enumerate(line_items_raw)
+        if _li.get("is_product_line", True)
+    ]
+    n_hidden = len(line_items_raw) - len(visible_idx)
+    n_lines = len(visible_idx)
     sup = extracted.get("supplier") or {}
     sup_name = (sup.get("name") or "").strip()
 
@@ -569,7 +668,8 @@ if S["ing_step"] == "review":
 
     # ---- Aggregate counts for top bar ----
     ready_count = blocked_count = rejected_count = undecided_count = 0
-    for ls in lines_state:
+    for _vi in visible_idx:
+        ls = lines_state[_vi]
         status = ls.get("status") or "À décider"
         cost = float(ls.get("cost_ht") or 0)
         # An inline "+ créer nouveau…" famille / norme isn't ready until its
@@ -627,6 +727,8 @@ if S["ing_step"] == "review":
     )
     if blocked_count:
         chips_html += hf_chip(f"⚠ {blocked_count} bloquées", "danger")
+    if n_hidden:
+        chips_html += hf_chip(f"{n_hidden} non-produit ignorées", "ghost")
     chips_html += "</div>"
     st.markdown(chips_html, unsafe_allow_html=True)
 
@@ -635,7 +737,10 @@ if S["ing_step"] == "review":
         if st.button("↺ recommencer", key="ing_reset_top", use_container_width=True):
             _reset()
             st.rerun()
-    # (raw Gemini JSON popover removed — too technical for the team UI)
+    with ac2:
+        # Keep the source invoice on screen while reviewing: the whole point of
+        # the relecture is comparing what Gemini extracted against the paper.
+        show_pdf = st.toggle("📄 Facture", value=True, key="ing_show_pdf")
     with ac3:
         if st.button(
             f"✓ Valider et insérer ({ready_count})",
@@ -672,12 +777,16 @@ if S["ing_step"] == "review":
     if "active_line_idx" not in S:
         S["active_line_idx"] = 0
     active_idx = int(S["active_line_idx"])
-    if active_idx >= n_lines:
-        active_idx = 0
-        S["active_line_idx"] = 0
+    if active_idx not in visible_idx:
+        active_idx = visible_idx[0] if visible_idx else 0
+        S["active_line_idx"] = active_idx
 
-    # ---- TWO-COLUMN: list | editor ----
-    col_list, col_editor = st.columns([0.32, 0.68], gap="medium")
+    # ---- COLUMNS: list | editor [| invoice] ----
+    if show_pdf:
+        col_list, col_editor, col_pdf = st.columns([0.22, 0.46, 0.32], gap="medium")
+    else:
+        col_list, col_editor = st.columns([0.32, 0.68], gap="medium")
+        col_pdf = None
 
     # ===== LEFT: sticky line list =====
     with col_list:
@@ -686,7 +795,8 @@ if S["ing_step"] == "review":
             unsafe_allow_html=True,
         )
         st.markdown('<div class="hf-line-list-wrapper">', unsafe_allow_html=True)
-        for i, (li, mr, ls) in enumerate(zip(line_items_raw, match_results, lines_state)):
+        for _pos, i in enumerate(visible_idx):
+            li, mr, ls = line_items_raw[i], match_results[i], lines_state[i]
             status = ls.get("status") or "À décider"
             cost = float(ls.get("cost_ht") or 0)
             triplet_ok = (
@@ -706,14 +816,55 @@ if S["ing_step"] == "review":
                 or f"ligne {i+1}"
             )
             desig_short = desig if len(desig) <= 30 else (desig[:28] + "…")
-            label = f"{i+1:02d}  {dot}  {desig_short}"
+            label = f"{_pos+1:02d}  {dot}  {desig_short}"
             btn_type = "primary" if i == active_idx else "secondary"
             if st.button(label, key=f"line_btn_{i}", use_container_width=True, type=btn_type):
                 S["active_line_idx"] = i
                 st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ===== RIGHT: focused editor =====
+    # ===== RIGHT-MOST: the source invoice, scrollable, all pages =====
+    if col_pdf is not None:
+        with col_pdf:
+            st.markdown(
+                f'<h2 class="hf-h2" style="margin:0 0 6px 0">Facture source</h2>'
+                f'<div class="hf-muted" style="font-size:10.5px;margin-bottom:6px">'
+                f'{file_short}</div>',
+                unsafe_allow_html=True,
+            )
+            _pdf_raw = S.get("ing_pdf_bytes")
+            if not _pdf_raw and S.get("ing_file_path"):
+                try:  # session lost the bytes (e.g. after a page switch) → disk
+                    _pdf_raw = Path(S["ing_file_path"]).read_bytes()
+                    S["ing_pdf_bytes"] = _pdf_raw
+                except OSError:
+                    _pdf_raw = None
+            if _pdf_raw:
+                _pages = _render_invoice_pages(_pdf_raw)
+                if _pages:
+                    with st.container(height=640, border=True):
+                        for _pi, _png in enumerate(_pages):
+                            st.image(_png, use_column_width=True)
+                            if _pi < len(_pages) - 1:
+                                st.markdown(
+                                    '<div class="hf-muted" style="text-align:center;'
+                                    f'font-size:10px;padding:2px 0">page {_pi + 2}</div>',
+                                    unsafe_allow_html=True,
+                                )
+                    st.download_button(
+                        "⬇ PDF original",
+                        data=_pdf_raw,
+                        file_name=file_short,
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="ing_dl_pdf",
+                    )
+                else:
+                    st.warning("Aperçu indisponible — utilise le PDF original.")
+            else:
+                st.info("Fichier source introuvable.")
+
+    # ===== MIDDLE: focused editor =====
     with col_editor:
         if n_lines == 0:
             st.info("Aucune ligne extraite.")

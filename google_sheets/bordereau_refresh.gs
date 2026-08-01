@@ -72,6 +72,12 @@ function onOpen() {
     // namespace, so it's callable from here. Installs / refreshes the
     // "Pilotage de rentabilité" recap + the SST / hidden-id columns.
     .addItem('📊 Installer / MAJ rentabilité', 'applyRentabilite')
+    // Full template install/refresh (mr_cascade.gs, same bound-script
+    // namespace): cascade cost formulas, Helpers!A picker key — now 5-part
+    // WITH fournisseur — and the dynamic AD famille list. Run this after
+    // pasting a new version of the scripts; it calls applyRentabilite() itself
+    // at the end. Was previously only reachable from the script editor.
+    .addItem('🔧 Installer / MAJ modèle complet', 'applyV24Patch')
     .addItem('⚙ Configurer l\'URL Bordereau…', 'setBordereauUrl')
     .addItem('⚙ Configurer l\'URL Taxonomy…', 'setTaxonomyUrl')
     .addToUi();
