@@ -511,14 +511,6 @@ def _render_product_form(edit_id_arg):
                 unsafe_allow_html=True,
             )
 
-            st.markdown(
-                '<div class="hf-muted" style="font-size:11px;margin-top:4px">'
-                "↳ chaque liste propose <code style='font-family:JetBrains Mono,monospace;"
-                "background:var(--hf-cream);padding:1px 5px;border-radius:3px;font-size:10.5px'>"
-                "+ créer nouveau…</code> pour ajouter un triplet manquant au référentiel."
-                "</div>",
-                unsafe_allow_html=True,
-            )
 
         st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
 
@@ -823,13 +815,6 @@ def _render_product_form(edit_id_arg):
                                 "l'auto-remplissage."
                             )
 
-            st.markdown(
-                '<div class="hf-muted" style="font-size:11px;margin-top:8px">'
-                "↳ valeurs reprises de la norme. Pour les modifier en détail, "
-                "passez par la page « Normes de pose »."
-                "</div>",
-                unsafe_allow_html=True,
-            )
 
         st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
 

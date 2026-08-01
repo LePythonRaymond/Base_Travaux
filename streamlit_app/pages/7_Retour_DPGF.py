@@ -1411,13 +1411,8 @@ def _render_rentabilite() -> None:
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<p class="hf-muted" style="font-size:12.5px;margin:0 0 12px 0;max-width:780px">'
-        "Chaque DPGF re-ingéré (signé) est conservé ici — le fichier et sa rentabilité. "
-        "Les chiffres viennent de la <b>feuille « Pilotage de rentabilité » du DPGF</b> "
-        "(source de vérité — c'est là que Vincent gère prix, coefficients et marges) ; "
-        "le calcul interne de l'app ne sert que de contre-vérification "
-        "(badge <b>≠ calcul</b> en cas d'écart). Les imports plus anciens, sans bloc "
-        "rentabilité, retombent sur le calcul interne (badge <i>calculé</i>).</p>",
+        '<p class="hf-muted" style="font-size:12.5px;margin:0 0 12px 0">'
+        "L'historique des projets ré-ingérés, avec leur rentabilité.</p>",
         unsafe_allow_html=True,
     )
 

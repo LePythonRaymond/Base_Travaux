@@ -73,10 +73,10 @@ _CSS = r"""
   --hf-white:        #ffffff;
   --hf-ink:          #111613;
   --hf-body:         #2a2e2c;
-  --hf-muted:        #6e7068;
+  --hf-muted:        #595b53;
   --hf-soft:         #a9a896;
   --hf-border:       #d8d1b8;
-  --hf-border-soft:  #e7e0c8;
+  --hf-border-soft:  #d9cfae;
   --hf-hover:        #ece5cf;
 
   --hf-green:        #1d3a2a;
@@ -295,7 +295,7 @@ code, pre { font-family: 'JetBrains Mono', monospace !important; font-size: 11.5
 [data-baseweb="textarea"] textarea,
 [data-baseweb="select"] {
     font-family: 'Inter', sans-serif !important;
-    font-size: 12px !important;
+    font-size: 13px !important;
     color: var(--hf-ink) !important;
 }
 [data-baseweb="input"]:focus-within > div,
@@ -315,10 +315,10 @@ code, pre { font-family: 'JetBrains Mono', monospace !important; font-size: 11.5
 
 /* labels above inputs (Streamlit's stWidgetLabel) */
 [data-testid="stWidgetLabel"] p {
-    font-size: 10.5px !important;
-    color: var(--hf-muted) !important;
+    font-size: 11.5px !important;
+    color: var(--hf-body) !important;
     letter-spacing: 0.02em;
-    font-weight: 500 !important;
+    font-weight: 600 !important;
     margin-bottom: 6px !important;
 }
 
@@ -435,41 +435,36 @@ code, pre { font-family: 'JetBrains Mono', monospace !important; font-size: 11.5
     color: #faf5e6 !important;
 }
 
-/* Text/number/select inputs INSIDE a real bordered card: drop the white
-   (or auto-cream) fill, use a flat transparent bg with bottom hairline
-   only. Kills the "filled-rectangle on cream card" nested-card feel.
-   Focused state turns the bottom underline green.
-
-   GOTCHA: Streamlit's text input has TWO wrapper divs that both carry
-   bg styling: the outer `[data-testid="stTextInputRootElement"]` (which
-   defaults to a slightly-darker cream rectangle) and the inner
-   `[data-baseweb="input"] > div`. We have to flatten BOTH. Same dual
-   wrapper applies to selectbox (stSelectboxRootElement) and number
-   input (stNumberInputContainer + step buttons). */
+/* Text/number/select inputs INSIDE a bordered card: WHITE fill + a full
+   visible border. (The previous "flat underline-only" treatment tested
+   badly — fields drowned into the cream card and the whole form read as
+   low-contrast; user feedback 2026-08.) The white rectangle is what makes
+   a field read as "type here". */
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stTextInputRootElement"],
-[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="input"],
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="input"] > div,
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="select"] > div,
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="textarea"] > div,
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stNumberInputContainer"],
-[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stNumberInputStepUp"],
-[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stNumberInputStepDown"],
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) .stNumberInput input,
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) .stDateInput input {
-    background: transparent !important;
-    border-color: transparent !important;
-    border-bottom: 1px solid var(--hf-border-soft) !important;
-    border-radius: 0 !important;
+    background: var(--hf-white) !important;
+    border: 1px solid var(--hf-border) !important;
+    border-radius: var(--hf-radius-sm) !important;
     box-shadow: none !important;
 }
-/* Hover/focus underline turns soft green */
+/* number-input step buttons: visible, attached to the field */
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stNumberInputStepUp"],
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stNumberInputStepDown"] {
+    background: var(--hf-paper) !important;
+    border: 1px solid var(--hf-border) !important;
+}
+/* Focus: green border + soft ring, same as the base (out-of-card) inputs */
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stTextInputRootElement"]:focus-within,
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="input"]:focus-within > div,
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="select"]:focus-within > div,
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="textarea"]:focus-within > div {
-    border-color: transparent !important;
-    border-bottom-color: var(--hf-green) !important;
-    box-shadow: none !important;
+    border-color: var(--hf-green) !important;
+    box-shadow: 0 0 0 2px rgba(29,58,42,0.10) !important;
 }
 
 /* Non-primary buttons INSIDE a real bordered card: drop the visible

@@ -208,13 +208,21 @@ def _render_pdf_preview(pdf_bytes: bytes) -> None:
         st.warning(f"Aperçu impossible : {exc}")
 
 
+@st.fragment(run_every=6)
 def _render_jobs_panel() -> None:
     """Progress of the background worker — the reason a scan survives a tab close.
 
-    Rendered on the upload screen. Auto-refreshes while anything is in flight so
-    the user sees jobs move queued → running → done without touching anything.
+    A FRAGMENT with run_every: only this panel re-renders every 6s. The previous
+    implementation did `time.sleep(4)` + `st.rerun()` of the WHOLE page while
+    jobs were active — which greyed the app out in a loop and made everything
+    feel broken (the reported "hopping").
     """
-    jobs = recent_jobs(limit=15)
+    try:
+        jobs = recent_jobs(limit=15)
+    except Exception:
+        # Table `ingestion_jobs` absente (migration 08 pas encore appliquée) —
+        # ne pas casser la page pour un panneau de confort.
+        return
     if not jobs:
         return
     counts = job_counts()
@@ -260,10 +268,8 @@ def _render_jobs_panel() -> None:
             unsafe_allow_html=True,
         )
 
-    if n_active:
-        # Cheap poll: rerun every 4s only while work is in flight.
-        time.sleep(4)
-        st.rerun()
+    # (Pas de sleep/rerun ici : le fragment se recharge tout seul via run_every,
+    #  sans griser la page ni bloquer les clics.)
 
 
 @st.cache_data(show_spinner=False, max_entries=4, ttl=1800)
@@ -430,7 +436,6 @@ if S["ing_step"] == "upload":
                 + (f" ({skipped} déjà ingérés, sautés.)" if skipped else "")
             )
             st.info("Suis l'avancement ci-dessous, puis relis sur **À classifier → Ingestion en attente**.")
-            st.rerun()
 
         _render_jobs_panel()
         st.stop()
