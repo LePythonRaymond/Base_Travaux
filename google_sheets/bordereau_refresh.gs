@@ -158,14 +158,27 @@ function _refreshTab_(tabName, propKey) {
 }
 
 /* Per-tab wrappers. Callable from the menu (toast feedback) or other code. */
-function refreshBordereau() { return _toastRefresh_('Bordereau', _refreshTab_('Bordereau', REFRESH_DOC_PROP_URL)); }
-function refreshTaxonomy()  { return _toastRefresh_('Taxonomy',  _refreshTab_('Taxonomy',  REFRESH_DOC_PROP_TAXO_URL)); }
+function refreshBordereau() {
+  const n = _refreshTab_('Bordereau', REFRESH_DOC_PROP_URL);
+  try { invalidateCascadeCache(); } catch (e) {}
+  return _toastRefresh_('Bordereau', n);
+}
+function refreshTaxonomy() {
+  const n = _refreshTab_('Taxonomy', REFRESH_DOC_PROP_TAXO_URL);
+  try { invalidateCascadeCache(); } catch (e) {}
+  try { refreshFamilleDropdown(); } catch (e) {}
+  return _toastRefresh_('Taxonomy', n);
+}
 
 /* Both tabs in one go — this is what the time-driven trigger calls so the
    Bordereau AND the Taxonomy stay fresh on the same interval. */
 function refreshAll() {
   const b = _refreshTab_('Bordereau', REFRESH_DOC_PROP_URL);
   const t = _refreshTab_('Taxonomy',  REFRESH_DOC_PROP_TAXO_URL);
+  // The cascade keeps a CacheService snapshot of both tabs (mr_cascade.gs)
+  // — drop it now that the data changed, and rebuild the AD famille list.
+  try { invalidateCascadeCache(); } catch (e) {}
+  try { refreshFamilleDropdown(); } catch (e) {}
   SpreadsheetApp.getActive().toast(
     '↻ Bordereau : ' + _statusText_(b) + '  ·  Taxonomy : ' + _statusText_(t),
     REFRESH_MENU_NAME, 5

@@ -20,6 +20,7 @@ import logging
 import os
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -161,6 +162,16 @@ def _save_pdf(uploaded_file) -> tuple[Path, str]:
     return path, sha
 
 
+def _save_pdf_bytes(name: str, raw: bytes) -> tuple[Path, str]:
+    """Same as _save_pdf but for a (name, bytes) pair (batch/zip mode)."""
+    sha = hashlib.sha256(raw).hexdigest()
+    invoice_dir = _invoice_dir()
+    invoice_dir.mkdir(parents=True, exist_ok=True)
+    path = invoice_dir / f"{uuid.uuid4().hex}__{Path(name).name}"
+    path.write_bytes(raw)
+    return path, sha
+
+
 def _check_duplicate(sha: str) -> dict[str, Any] | None:
     return fetch_one(
         """
@@ -272,7 +283,77 @@ if S["ing_step"] == "upload":
     render_header(title="Ingestion facture", subtitle="étape 1 / 4 · dépôt")
     hf_stepper(["Dépôt", "Extraction", "Relecture", "Valider"], current_idx=0)
 
-    uploaded = st.file_uploader("Choisissez un PDF de facture", type=["pdf"])
+    uploads = st.file_uploader(
+        "Choisissez un ou plusieurs PDF (ou un .zip de devis/factures)",
+        type=["pdf", "zip"],
+        accept_multiple_files=True,
+    )
+
+    # Expand any .zip into its PDF members; collect (name, bytes) pairs.
+    batch_files: list[tuple[str, bytes]] = []
+    for up in uploads or []:
+        if up.name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(up.getvalue())) as zf:
+                    for member in zf.namelist():
+                        base = os.path.basename(member)
+                        if (member.lower().endswith(".pdf")
+                                and not member.startswith("__MACOSX")
+                                and base and not base.startswith("._")):
+                            batch_files.append((base, zf.read(member)))
+            except zipfile.BadZipFile:
+                st.error(f"« {up.name} » n'est pas un zip valide — ignoré.")
+        else:
+            batch_files.append((up.name, up.getvalue()))
+
+    # ── BATCH MODE (several PDFs): extract each one sequentially, park every
+    #    line in the file d'attente, review on the page « À classifier ».
+    #    One bad PDF never interrupts the batch.
+    if len(batch_files) > 1:
+        st.markdown(
+            f'<p class="hf-muted" style="font-size:12.5px">**{len(batch_files)} PDF** détectés — '
+            "mode lot : chaque document est analysé puis envoyé dans la file d'attente "
+            "(page <b>À classifier → Ingestion en attente</b>) pour relecture.</p>",
+            unsafe_allow_html=True,
+        )
+        if st.button(f"Analyser les {len(batch_files)} PDF", type="primary"):
+            labor_norms = fetch_all("SELECT task_name FROM labor_norms ORDER BY task_name")
+            families = fetch_all("SELECT id, name FROM product_families ORDER BY name")
+            prog = st.progress(0.0)
+            report: list[str] = []
+            for i, (fname, fraw) in enumerate(batch_files):
+                prog.progress(i / len(batch_files), text=f"{fname} ({i + 1}/{len(batch_files)})")
+                fsha = hashlib.sha256(fraw).hexdigest()
+                if _check_duplicate(fsha):
+                    report.append(f"⏭ {fname} — déjà ingéré, sauté")
+                    continue
+                try:
+                    fpath, _ = _save_pdf_bytes(fname, fraw)
+                    extracted_b = extract_invoice(
+                        fraw,
+                        labor_norm_names=[ln["task_name"] for ln in labor_norms],
+                        family_names=[f["name"] for f in families],
+                    )
+                    qids = _persist_extraction(extracted_b, file_path=fpath, file_hash=fsha)
+                    report.append(f"✓ {fname} — {len(qids)} ligne(s) en file d'attente")
+                except Exception as exc:  # noqa: BLE001 — a bad file must not kill the batch
+                    report.append(f"✗ {fname} — échec : {type(exc).__name__}: {str(exc)[:140]}")
+                # Small pause between Gemini calls to stay clear of rate limits.
+                time.sleep(2)
+            prog.progress(1.0, text="Terminé")
+            ok = sum(1 for r in report if r.startswith("✓"))
+            st.success(f"Lot terminé : {ok}/{len(batch_files)} PDF analysés.")
+            for r in report:
+                st.markdown(f"- {r}")
+            st.info("Relecture et validation : page **À classifier → Ingestion en attente**.")
+        st.stop()
+
+    uploaded = uploads[0] if len(batch_files) == 1 and uploads and not uploads[0].name.lower().endswith(".zip") else None
+    if len(batch_files) == 1 and uploaded is None:
+        # Single PDF that came out of a zip: wrap it for the interactive flow.
+        _zn, _zb = batch_files[0]
+        uploaded = io.BytesIO(_zb)
+        uploaded.name = _zn  # type: ignore[attr-defined]
     if uploaded is not None:
         raw = uploaded.getvalue()
         sha = hashlib.sha256(raw).hexdigest()
@@ -321,9 +402,19 @@ if S["ing_step"] == "upload":
                         labor_norm_names=[ln["task_name"] for ln in labor_norms],
                         family_names=[f["name"] for f in families],
                     )
-                except ExtractionError as exc:
+                except Exception as exc:  # noqa: BLE001
+                    # Catch-all on purpose: auth/quota/network errors are NOT
+                    # ExtractionError and used to explode as a raw traceback in
+                    # the UI (seen in prod). Everything lands here as a clean
+                    # French message + a needs_info trace row.
                     tracker.fail(2, status_label="Échec de l'extraction.")
-                    st.error(f"Échec de l'extraction Gemini : {exc}")
+                    if isinstance(exc, ExtractionError):
+                        st.error(f"Échec de l'extraction Gemini : {exc}")
+                    else:
+                        st.error(
+                            "Échec de l'analyse du PDF (erreur technique, pas le contenu "
+                            f"du document) : {type(exc).__name__}: {exc}"
+                        )
                     engine = get_engine()
                     with engine.begin() as conn:
                         conn.execute(
@@ -544,9 +635,7 @@ if S["ing_step"] == "review":
         if st.button("↺ recommencer", key="ing_reset_top", use_container_width=True):
             _reset()
             st.rerun()
-    with ac2:
-        with st.popover("JSON brut Gemini", use_container_width=True):
-            st.json(extracted)
+    # (raw Gemini JSON popover removed — too technical for the team UI)
     with ac3:
         if st.button(
             f"✓ Valider et insérer ({ready_count})",
@@ -1006,6 +1095,42 @@ if S["ing_step"] == "review":
                     )
 
                     chosen = ls.get("chosen_product")
+                    if isinstance(chosen, int):
+                        # Supplier policy (Vincent's rule): a matched product is
+                        # RE-HOMED to the invoice supplier only when it sits on
+                        # the 'Fournisseur inconnu' placeholder. If it belongs to
+                        # a DIFFERENT real supplier, we do NOT steal the row —
+                        # the line falls through to the upsert below, creating a
+                        # separate row per supplier (price competition kept).
+                        cur = conn.execute(
+                            text(
+                                "SELECT p.supplier_id, s.name AS supplier_name "
+                                "FROM products p JOIN suppliers s ON s.id = p.supplier_id "
+                                "WHERE p.id = :id"
+                            ),
+                            {"id": chosen},
+                        ).mappings().first()
+                        same_supplier = cur and int(cur["supplier_id"]) == int(common["supplier_id"])
+                        is_placeholder = cur and cur["supplier_name"] == "Fournisseur inconnu"
+                        if not cur:
+                            chosen = None  # product vanished — treat as new
+                        elif not (same_supplier or is_placeholder):
+                            chosen = None  # different real supplier → separate row
+                        elif is_placeholder and not same_supplier:
+                            # Re-homing must not collide with an existing row
+                            # already keyed (name, packaging, invoice supplier):
+                            # in that case merge into it via the upsert instead.
+                            dup = conn.execute(
+                                text(
+                                    "SELECT 1 FROM products WHERE reference_name = :ref "
+                                    "AND packaging = :packaging AND supplier_id = :supplier_id "
+                                    "AND id <> :id"
+                                ),
+                                {"ref": common["ref"], "packaging": common["packaging"],
+                                 "supplier_id": common["supplier_id"], "id": chosen},
+                            ).first()
+                            if dup:
+                                chosen = None
                     if isinstance(chosen, int):
                         conn.execute(
                             text(

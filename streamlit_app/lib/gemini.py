@@ -104,6 +104,28 @@ def _generate(
     return text
 
 
+def _salvage_json(text: str) -> str | None:
+    """Extract the outermost JSON object from a fenced/prose-wrapped response.
+
+    Returns None when no plausible {...} block is present.
+    """
+    s = text.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.lower().startswith("json"):
+            s = s[4:]
+        s = s.strip()
+    start, end = s.find("{"), s.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    candidate = s[start:end + 1]
+    try:
+        json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return candidate
+
+
 def _parse_invoice(text: str) -> ExtractedInvoice:
     """Strict parse of model output → ExtractedInvoice. Raises ExtractionError."""
     try:
@@ -195,8 +217,10 @@ def extract_invoice(
             continue
 
         # Attempt 1: direct PDF input
+        doc_parts: list[Any]
         try:
             pdf_part = {"mime_type": "application/pdf", "data": pdf_bytes}
+            doc_parts = [pdf_part]
             text = _generate(model, [pdf_part, user_prompt])
         except Exception as exc:
             log.warning(
@@ -211,6 +235,7 @@ def extract_invoice(
                 continue
             try:
                 image_parts = [{"mime_type": "image/png", "data": b} for b in images]
+                doc_parts = image_parts
                 text = _generate(model, [*image_parts, user_prompt])
             except Exception as img_exc:
                 log.warning("Image fallback also failed for model %s: %s", model_name, img_exc)
@@ -220,10 +245,18 @@ def extract_invoice(
                     continue
                 raise
 
-        # Attempt to parse; one retry with the error appended.
+        # Attempt to parse; salvage pass, then one retry with the error appended.
         try:
             return _parse_invoice(text)
         except ExtractionError as parse_exc:
+            # Salvage: models sometimes wrap valid JSON in ```json fences or
+            # prose. Extract the outermost {...} before burning another call.
+            salvaged = _salvage_json(text)
+            if salvaged is not None:
+                try:
+                    return _parse_invoice(salvaged)
+                except ExtractionError:
+                    pass
             log.info("First parse failed; retrying with error context. (%s)", parse_exc)
             try:
                 retry_prompt = (
@@ -231,7 +264,11 @@ def extract_invoice(
                     + "\n\n# CORRECTION\nLa réponse précédente n'était pas un JSON valide. "
                     + f"Erreur : {parse_exc}\nRenvoie un JSON strict, sans texte autour."
                 )
-                text2 = _generate(model, [retry_prompt])
+                # CRITICAL: resend the document. The old retry sent only the
+                # text prompt — without the PDF/images the model cannot
+                # re-extract anything, so the retry could never succeed
+                # (observed in prod logs as back-to-back json_invalid).
+                text2 = _generate(model, [*doc_parts, retry_prompt])
                 return _parse_invoice(text2)
             except Exception as retry_exc:
                 last_exc = retry_exc

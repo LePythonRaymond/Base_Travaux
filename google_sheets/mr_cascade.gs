@@ -70,6 +70,7 @@ const BORDEREAU_REFERENCE_NAME = 2;   // B
 const BORDEREAU_FAMILY_NAME    = 3;   // C
 const BORDEREAU_SUBCATEGORY    = 4;   // D
 const BORDEREAU_PACKAGING      = 7;   // G
+const BORDEREAU_SUPPLIER_NAME  = 12;  // L — fournisseur (5e segment de la chaîne produit)
 const BORDEREAU_LAST_ROW       = 502;
 
 // Taxonomy CSV columns (1-indexed). Must stay in sync with bordereau_api/main.py.
@@ -150,7 +151,14 @@ function handleProduitDirectEdit_(sheet, row, bord, taxo) {
 
   // 1. Try the 4-part picker format ("Famille — Sous-cat — Ref — Cond.").
   const parts = raw.split(' — ').map(function (s) { return s.trim(); });
-  if (parts.length === 4) {
+  var fournisseur = null;
+  if (parts.length === 5) {
+    famille  = parts[0];
+    sousCat  = parts[1];
+    ref      = parts[2];
+    packaging = parts[3];
+    fournisseur = parts[4];
+  } else if (parts.length === 4) {
     famille  = parts[0];
     sousCat  = parts[1];
     ref      = parts[2];
@@ -192,6 +200,7 @@ function handleProduitDirectEdit_(sheet, row, bord, taxo) {
     subcategory: sousCat,
     reference_name: ref,
     packaging: packaging,
+    supplier_name: fournisseur || null,   // null = skipped by _findBordereauRow
   });
   if (!bordMatch) {
     // The product on this picker string isn't in our DB. Leave the
@@ -208,6 +217,15 @@ function handleProduitDirectEdit_(sheet, row, bord, taxo) {
   sheet.getRange(row, COL_AE).setValue(sousCat);
   sheet.getRange(row, COL_AF).setValue(packaging);
 
+  // Canonicalise AG to the 5-part string (adds the fournisseur) so the
+  // exact-MATCH formulas against Helpers!A — now 5-part — keep resolving,
+  // including for legacy 4-part strings pasted from old sheets.
+  if (parts.length !== 5 && bordMatch.supplier_name) {
+    sheet.getRange(row, COL_AG).setValue(
+      famille + ' — ' + sousCat + ' — ' + ref + ' — ' + packaging + ' — ' + bordMatch.supplier_name
+    );
+  }
+
   // 4. Rebuild every dropdown for the row so AE/AF/AG are populated with
   // the correct option lists (and AG now includes our chosen value, so
   // the red "Non valide" triangle disappears).
@@ -215,6 +233,31 @@ function handleProduitDirectEdit_(sheet, row, bord, taxo) {
   refreshCondDropdown_(sheet, row, taxo);
   refreshProduitDropdown_(sheet, row, bord);
 }
+
+
+/**
+ * AD (Famille) dropdown = unique families from the Taxonomy tab.
+ * Re-run after every taxonomy refresh so families created in the app
+ * appear in the sheet without regenerating the template.
+ */
+function refreshFamilleValidation_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dpgf = ss.getSheetByName(DPGF_SHEET);
+  if (!dpgf) return;
+  const fams = new Set();
+  readTaxonomy_().forEach(function(r) {
+    if (r.family_name) fams.add(r.family_name);
+  });
+  const list = Array.from(fams).sort();
+  if (list.length === 0) return;
+  const rule = SpreadsheetApp.newDataValidation()
+                 .requireValueInList(list, true)
+                 .setAllowInvalid(true)
+                 .build();
+  dpgf.getRange(DATA_FIRST_ROW, COL_AD, 500, 1).setDataValidation(rule);
+}
+/* Public wrapper — called from bordereau_refresh.gs after refreshAll. */
+function refreshFamilleDropdown() { refreshFamilleValidation_(); }
 
 
 /**
@@ -310,11 +353,14 @@ function refreshProduitDropdown_(sheet, row, bord) {
     if (famille && r.family_name !== famille) continue;
     if (sousCat && r.subcategory !== sousCat) continue;
     if (condit  && r.packaging   !== condit ) continue;
+    // 5-part chaîne : le fournisseur différencie deux fournisseurs vendant
+    // le même produit (même quadruplet → indistinguable sans lui).
     refs.push(
       r.family_name + ' — ' +
       r.subcategory + ' — ' +
       r.reference_name + ' — ' +
-      r.packaging
+      r.packaging +
+      (r.supplier_name ? ' — ' + r.supplier_name : '')
     );
   }
   refs.sort();
@@ -453,6 +499,24 @@ function applyV24Patch() {
   for (const [cell, srcCol] of HELP_MAP) {
     helpers.getRange(cell).setFormula(_formulaForLocale(numericMirror(srcCol)));
   }
+
+  // Helpers!A = the picker MATCH key, now script-managed and 5-PART
+  // (famille — sous-cat — référence — cond. — fournisseur). Must build the
+  // EXACT same string as refreshProduitDropdown_, or every AI/AJ/AK..AQ/BE
+  // formula stops resolving. Clear the old baked per-cell 4-part formulas
+  // first so the ARRAYFORMULA can expand.
+  helpers.getRange('A1').setValue('picker_key (auto, 5 parties)');
+  helpers.getRange('A2:A501').clearContent();
+  helpers.getRange('A2').setFormula(_formulaForLocale(
+    '=ARRAYFORMULA(IF(LEN(Bordereau!B2:B501)=0, "", ' +
+    'Bordereau!C2:C501 & " — " & Bordereau!D2:D501 & " — " & Bordereau!B2:B501 & " — " & Bordereau!G2:G501 & ' +
+    'IF(LEN(Bordereau!L2:L501)=0, "", " — " & Bordereau!L2:L501)))'
+  ));
+
+  // AD (Famille) : dynamic dropdown from the Taxonomy tab. The old template
+  // baked a static 16-family list — new families (Drainage, Bac/jardinière,
+  // Étanchéité…) never appeared. allowInvalid keeps free typing possible.
+  refreshFamilleValidation_();
 
   // --- 2. DPGF cost-chain formulas, rows 3..502 ---------------------
   const ALL_LBL = ALL;
@@ -985,10 +1049,54 @@ function diagnoseFormulas() {
  * Read the Bordereau tab once. Returns an array of {reference_name,
  * family_name, subcategory, packaging}. Skips "À classifier" rows.
  */
+// ── Cascade cache ──────────────────────────────────────────────────
+// The Bordereau/Taxonomy tabs only change at refreshAll time, yet every
+// onEdit used to re-read ~7 500 cells. CacheService keeps a JSON snapshot
+// (document scope, 1h TTL); bordereau_refresh.gs invalidates it right
+// after rewriting the tabs. Chunked storage stays under the 100KB/key cap.
+var _CASCADE_CACHE_VER = 'v1';
+function _cacheGetJson_(key) {
+  try {
+    var c = CacheService.getDocumentCache();
+    var meta = c.get(key + ':n');
+    if (!meta) return null;
+    var n = parseInt(meta, 10), parts = [];
+    for (var i = 0; i < n; i++) {
+      var chunk = c.get(key + ':' + i);
+      if (chunk == null) return null;
+      parts.push(chunk);
+    }
+    return JSON.parse(parts.join(''));
+  } catch (e) { return null; }
+}
+function _cachePutJson_(key, obj) {
+  try {
+    var c = CacheService.getDocumentCache();
+    var jsonStr = JSON.stringify(obj), SIZE = 90000, chunks = [];
+    for (var i = 0; i < jsonStr.length; i += SIZE) chunks.push(jsonStr.substring(i, i + SIZE));
+    var payload = {};
+    payload[key + ':n'] = String(chunks.length);
+    for (var j = 0; j < chunks.length; j++) payload[key + ':' + j] = chunks[j];
+    c.putAll(payload, 3600);
+  } catch (e) { /* cache is best-effort */ }
+}
+function invalidateCascadeCache() {
+  try {
+    var c = CacheService.getDocumentCache();
+    ['bord', 'taxo'].forEach(function(k) {
+      var key = _CASCADE_CACHE_VER + ':' + k;
+      c.remove(key + ':n');
+      for (var i = 0; i < 12; i++) c.remove(key + ':' + i);
+    });
+  } catch (e) { /* best-effort */ }
+}
+
 function readBordereau_() {
+  var cached = _cacheGetJson_(_CASCADE_CACHE_VER + ':bord');
+  if (cached) return cached;
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(BORDEREAU_SHEET);
   if (!sheet) return [];
-  const rng = sheet.getRange(2, 1, BORDEREAU_LAST_ROW - 1, BORDEREAU_PACKAGING);
+  const rng = sheet.getRange(2, 1, BORDEREAU_LAST_ROW - 1, BORDEREAU_SUPPLIER_NAME);
   const values = rng.getValues();
   const out = [];
   for (const r of values) {
@@ -1001,8 +1109,10 @@ function readBordereau_() {
       family_name:    String(r[BORDEREAU_FAMILY_NAME - 1] || ''),
       subcategory:    subcategory,
       packaging:      String(r[BORDEREAU_PACKAGING - 1] || ''),
+      supplier_name:  String(r[BORDEREAU_SUPPLIER_NAME - 1] || ''),
     });
   }
+  _cachePutJson_(_CASCADE_CACHE_VER + ':bord', out);
   return out;
 }
 
@@ -1013,6 +1123,8 @@ function readBordereau_() {
  * with the "À classifier" rows.
  */
 function readTaxonomy_() {
+  var cached = _cacheGetJson_(_CASCADE_CACHE_VER + ':taxo');
+  if (cached) return cached;
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(TAXONOMY_SHEET);
   if (!sheet) return [];
   const rng = sheet.getRange(2, 1, TAXONOMY_LAST_ROW - 1, TAXONOMY_PACKAGING);
@@ -1027,5 +1139,6 @@ function readTaxonomy_() {
       packaging:   String(r[TAXONOMY_PACKAGING - 1] || ''),
     });
   }
+  _cachePutJson_(_CASCADE_CACHE_VER + ':taxo', out);
   return out;
 }

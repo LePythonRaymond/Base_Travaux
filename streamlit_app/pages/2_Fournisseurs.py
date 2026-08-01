@@ -89,9 +89,9 @@ suppliers = fetch_df(
     """
     SELECT s.id, s.name, s.category, s.contact_name, s.contact_email,
            s.contact_phone, s.address, s.payment_terms, s.rating, s.notes,
-           (SELECT count(*) FROM products p WHERE p.supplier_id = s.id) AS product_count,
+           (SELECT count(*) FROM products p WHERE p.supplier_id = s.id AND p.is_active) AS product_count,
            (SELECT EXTRACT(DAY FROM AGE(now(), MAX(p.last_price_update)))::int
-              FROM products p WHERE p.supplier_id = s.id) AS days_since_update
+              FROM products p WHERE p.supplier_id = s.id AND p.is_active) AS days_since_update
       FROM suppliers s
      ORDER BY s.name
     """

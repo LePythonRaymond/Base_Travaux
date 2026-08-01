@@ -513,12 +513,42 @@ with tab_needs_info:
                    candidate_packaging, candidate_unit_type,
                    candidate_supplier_id, candidate_supplier_hint,
                    candidate_labor_norm_id, candidate_labor_hint,
-                   candidate_cost_ht, review_notes, created_at
+                   candidate_cost_ht, review_notes, created_at,
+                   matched_product_id
               FROM ingestion_queue
              WHERE status IN ('pending', 'needs_info')
              ORDER BY created_at ASC
             """
         )
+
+        # ── Bulk action: reject everything still pending in one click.
+        #    (Bulk APPROVE stays deliberately absent — approving inserts into
+        #    the live catalogue and each row usually needs a human to fix the
+        #    unit / family first. Rejecting is safe and reversible in spirit:
+        #    the rows keep their data with status='rejected'.)
+        if queue_rows:
+            ba1, ba2 = st.columns([3, 1.4])
+            with ba1:
+                confirm_bulk = st.checkbox(
+                    f"Je confirme vouloir rejeter les {len(queue_rows)} lignes en attente",
+                    key="qni_bulk_confirm",
+                )
+            with ba2:
+                if st.button(
+                    f"⛔ Tout rejeter ({len(queue_rows)})",
+                    key="qni_bulk_reject",
+                    disabled=not confirm_bulk,
+                    use_container_width=True,
+                ):
+                    actor = os.environ.get("STREAMLIT_AUTH_USER", "system")
+                    execute(
+                        "UPDATE ingestion_queue SET status = 'rejected', "
+                        "reviewed_at = now(), reviewed_by = :by "
+                        "WHERE status IN ('pending', 'needs_info')",
+                        {"by": actor},
+                    )
+                    st.success("File vidée — toutes les lignes en attente ont été rejetées.")
+                    st.rerun()
 
         now_utc = datetime.now(timezone.utc)
         for q in queue_rows:
@@ -558,14 +588,8 @@ with tab_needs_info:
                 if q["review_notes"]:
                     st.warning(f"Notes : {q['review_notes']}")
 
-                with st.expander("Charge utile brute Gemini", expanded=False):
-                    payload = q["raw_payload"] or {}
-                    if isinstance(payload, str):
-                        try:
-                            payload = json.loads(payload)
-                        except json.JSONDecodeError:
-                            payload = {"raw": payload}
-                    st.json(payload)
+                # (raw Gemini payload expander removed — review_notes carries
+                # the human-readable reason; the payload stays in the DB.)
 
                 c1, c2 = st.columns(2)
                 with c1:
@@ -660,37 +684,84 @@ with tab_needs_info:
                                         norm_pick["new_unit"], norm_pick["new_pose_hours"],
                                     )
                                 _ensure_taxonomy_row(conn, _fid, chosen_sub, chosen_pack)
-                                res = conn.execute(
-                                    text(
-                                        """
-                                        INSERT INTO products
-                                            (reference_name, family_id, subcategory,
-                                             supplier_id, labor_norm_id,
-                                             packaging, unit_type, cost_ht)
-                                        VALUES
-                                            (:ref, :fid, :sub, :sup, :ln, :pkg, :unit, :cost)
-                                        ON CONFLICT (reference_name, packaging, supplier_id)
-                                          DO UPDATE SET
-                                            cost_ht       = EXCLUDED.cost_ht,
-                                            family_id     = EXCLUDED.family_id,
-                                            subcategory   = EXCLUDED.subcategory,
-                                            labor_norm_id = EXCLUDED.labor_norm_id,
-                                            unit_type     = EXCLUDED.unit_type
-                                        RETURNING id, (xmax = 0) AS is_insert
-                                        """
-                                    ),
-                                    {
-                                        "ref": ref_name.strip(),
-                                        "fid": _fid,
-                                        "sub": chosen_sub,
-                                        "sup": supplier_id,
-                                        "ln": _lid,
-                                        "pkg": chosen_pack,
-                                        "unit": unit_type,
-                                        "cost": float(cost_ht),
-                                    },
-                                ).first()
-                                product_id, is_insert = int(res[0]), bool(res[1])
+                                # Re-home rule (Vincent): if the matcher pinned this
+                                # row to an existing product parked on 'Fournisseur
+                                # inconnu', UPDATE that row (move it to the real
+                                # supplier) instead of creating a duplicate and
+                                # leaving the placeholder with a stale price. A
+                                # match owned by a DIFFERENT real supplier keeps
+                                # its row — the upsert creates a separate
+                                # per-supplier row (price competition preserved).
+                                _rehome_id = None
+                                if q.get("matched_product_id"):
+                                    _cur = conn.execute(
+                                        text(
+                                            "SELECT p.id, s.name AS supplier_name "
+                                            "FROM products p JOIN suppliers s ON s.id = p.supplier_id "
+                                            "WHERE p.id = :id"
+                                        ),
+                                        {"id": int(q["matched_product_id"])},
+                                    ).mappings().first()
+                                    if _cur and _cur["supplier_name"] == "Fournisseur inconnu":
+                                        _dup = conn.execute(
+                                            text(
+                                                "SELECT 1 FROM products WHERE reference_name = :ref "
+                                                "AND packaging = :pkg AND supplier_id = :sup AND id <> :id"
+                                            ),
+                                            {"ref": ref_name.strip(), "pkg": chosen_pack,
+                                             "sup": supplier_id, "id": int(_cur["id"])},
+                                        ).first()
+                                        if not _dup:
+                                            _rehome_id = int(_cur["id"])
+                                if _rehome_id:
+                                    conn.execute(
+                                        text(
+                                            """
+                                            UPDATE products SET
+                                                reference_name = :ref, family_id = :fid,
+                                                subcategory = :sub, supplier_id = :sup,
+                                                labor_norm_id = :ln, packaging = :pkg,
+                                                unit_type = :unit, cost_ht = :cost
+                                            WHERE id = :id
+                                            """
+                                        ),
+                                        {"ref": ref_name.strip(), "fid": _fid, "sub": chosen_sub,
+                                         "sup": supplier_id, "ln": _lid, "pkg": chosen_pack,
+                                         "unit": unit_type, "cost": float(cost_ht), "id": _rehome_id},
+                                    )
+                                    product_id, is_insert = _rehome_id, False
+                                else:
+                                    res = conn.execute(
+                                        text(
+                                            """
+                                            INSERT INTO products
+                                                (reference_name, family_id, subcategory,
+                                                 supplier_id, labor_norm_id,
+                                                 packaging, unit_type, cost_ht)
+                                            VALUES
+                                                (:ref, :fid, :sub, :sup, :ln, :pkg, :unit, :cost)
+                                            ON CONFLICT (reference_name, packaging, supplier_id)
+                                              DO UPDATE SET
+                                                cost_ht       = EXCLUDED.cost_ht,
+                                                family_id     = EXCLUDED.family_id,
+                                                subcategory   = EXCLUDED.subcategory,
+                                                labor_norm_id = EXCLUDED.labor_norm_id,
+                                                unit_type     = EXCLUDED.unit_type
+                                            RETURNING id, (xmax = 0) AS is_insert
+                                            """
+                                        ),
+                                        {
+                                            "ref": ref_name.strip(),
+                                            "fid": _fid,
+                                            "sub": chosen_sub,
+                                            "sup": supplier_id,
+                                            "ln": _lid,
+                                            "pkg": chosen_pack,
+                                            "unit": unit_type,
+                                            "cost": float(cost_ht),
+                                        },
+                                    ).first()
+                                    product_id, is_insert = int(res[0]), bool(res[1])
                                 if is_insert:
                                     conn.execute(
                                         text(

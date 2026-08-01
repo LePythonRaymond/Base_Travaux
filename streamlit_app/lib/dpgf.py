@@ -237,12 +237,19 @@ def parse_dpgf(xlsx_bytes: bytes) -> list[DpgfLine]:
         if picker_val and isinstance(picker_val, str) and picker_val.strip():
             line.picker = picker_val.strip()
             parts = [p.strip() for p in line.picker.split("—")]
-            if len(parts) == 4:
+            if len(parts) == 5:
+                # 5-part chaîne (current template): the 5th segment is the
+                # FOURNISSEUR — it disambiguates two suppliers selling the
+                # same product (same 4-tuple otherwise).
+                (line.famille, line.sous_cat, line.reference_name,
+                 line.conditionnement, picker_fournisseur) = parts
+                if picker_fournisseur and not line.fournisseur:
+                    line.fournisseur = picker_fournisseur
+            elif len(parts) == 4:
                 line.famille, line.sous_cat, line.reference_name, line.conditionnement = parts
-            else:
-                # Try old 3-part picker as a fallback
-                if len(parts) == 3:
-                    line.famille, line.reference_name, line.conditionnement = parts
+            elif len(parts) == 3:
+                # Legacy 3-part picker (oldest sheets)
+                line.famille, line.reference_name, line.conditionnement = parts
 
         pu_client = sheet.cell(row=r, column=COL_BC).value
         if isinstance(pu_client, (int, float)):

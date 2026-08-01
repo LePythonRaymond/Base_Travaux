@@ -1165,9 +1165,12 @@ def _render_product_form(edit_id_arg):
         # (handled by inline JS, no Streamlit rerun needed). Without this
         # we'd have a 2-click path: Streamlit button → `st.code` block →
         # the code-block's hover-revealed copy icon.
+        # 5-part chaîne: the FOURNISSEUR suffix disambiguates two suppliers
+        # selling the same product (must mirror the sheet's AG dropdown format).
         picker_str = (
             f"{family_by_id.get(family_id, '?')} — {subcategory or '?'} — "
-            f"{reference_name or '?'} — {packaging or '?'}"
+            f"{reference_name or '?'} — {packaging or '?'} — "
+            f"{supplier_by_id.get(supplier_id, '?')}"
         )
         # Stash the chain in a data-attribute (HTML-escape it) and read it
         # from JS via `this.dataset.chain` — that way we never embed quotes
@@ -1531,37 +1534,56 @@ with tab_catalogue:
             "ou l'onglet **Édition** ci-contre."
         )
     else:
-        # Cascading filter values from the live catalog data.
-        suppliers_in_catalog = ["Tous"] + sorted(cat_df["supplier_name"].dropna().unique().tolist())
-        families_in_catalog = ["Toutes"] + sorted(cat_df["family_name"].dropna().unique().tolist())
-        all_subcats = ["—"] + sorted(cat_df["subcategory"].dropna().unique().tolist())
-        all_packagings = ["—"] + sorted(cat_df["packaging"].dropna().unique().tolist())
+        # Faceted filters: every dropdown's option list is narrowed by ALL the
+        # OTHER current selections (read from session_state BEFORE the widgets
+        # render), so you can never pick a combination with zero products —
+        # e.g. after arriving from a supplier card, Famille only lists the
+        # families that supplier actually carries.
+        _sel_family = st.session_state.get("cat_family", "Toutes")
+        _sel_subcat = st.session_state.get("cat_subcat", "—")
+        _sel_pack = st.session_state.get("cat_packaging", "—")
+        _sel_supplier = st.session_state.get(
+            "cat_supplier", st.session_state.get("supplier_filter_name", "Tous")
+        )
 
-        # DPGF-style cascade: Famille → Sous-catégorie → Conditionnement,
-        # then Fournisseur / Fraîcheur / Recherche as orthogonal filters.
+        def _facet_mask(*, family=None, subcat=None, pack=None, supplier=None) -> pd.Series:
+            m = pd.Series(True, index=cat_df.index)
+            if family and family != "Toutes":
+                m &= cat_df["family_name"] == family
+            if subcat and subcat != "—":
+                m &= cat_df["subcategory"] == subcat
+            if pack and pack != "—":
+                m &= cat_df["packaging"] == pack
+            if supplier and supplier != "Tous":
+                m &= cat_df["supplier_name"] == supplier
+            return m
+
+        def _facet_opts(col: str, first: str, mask: pd.Series) -> list[str]:
+            return [first] + sorted(cat_df.loc[mask, col].dropna().unique().tolist())
+
+        families_in_catalog = _facet_opts(
+            "family_name", "Toutes",
+            _facet_mask(subcat=_sel_subcat, pack=_sel_pack, supplier=_sel_supplier),
+        )
+        subcat_choices = _facet_opts(
+            "subcategory", "—",
+            _facet_mask(family=_sel_family, pack=_sel_pack, supplier=_sel_supplier),
+        )
+        packaging_choices = _facet_opts(
+            "packaging", "—",
+            _facet_mask(family=_sel_family, subcat=_sel_subcat, supplier=_sel_supplier),
+        )
+        suppliers_in_catalog = _facet_opts(
+            "supplier_name", "Tous",
+            _facet_mask(family=_sel_family, subcat=_sel_subcat, pack=_sel_pack),
+        )
+
         f1, f2, f3, f4, f5, f6, f7 = st.columns([1, 1.2, 1.5, 1.4, 1, 1.5, 0.7])
 
         with f1:
             f_family = st.selectbox("Famille", options=families_in_catalog, key="cat_family")
-        # Sous-catégorie options cascade from Famille
-        if f_family != "Toutes":
-            subcat_choices = ["—"] + sorted(
-                cat_df.loc[cat_df["family_name"] == f_family, "subcategory"]
-                .dropna().unique().tolist()
-            )
-        else:
-            subcat_choices = all_subcats
         with f2:
             f_subcat = st.selectbox("Sous-catégorie", options=subcat_choices, key="cat_subcat")
-        # Conditionnement options cascade from (Famille, Sous-catégorie)
-        pack_mask = pd.Series(True, index=cat_df.index)
-        if f_family != "Toutes":
-            pack_mask &= cat_df["family_name"] == f_family
-        if f_subcat != "—":
-            pack_mask &= cat_df["subcategory"] == f_subcat
-        packaging_choices = ["—"] + sorted(
-            cat_df.loc[pack_mask, "packaging"].dropna().unique().tolist()
-        )
         with f3:
             f_packaging = st.selectbox(
                 "Conditionnement", options=packaging_choices, key="cat_packaging"

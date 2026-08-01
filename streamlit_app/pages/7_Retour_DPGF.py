@@ -391,24 +391,34 @@ if S["dpgf_step"] == 0:
                     method = "id"
 
             # ── 2a. TAXONOMY exact — full identity from the picker:
-            #         famille + sous-catégorie + conditionnement + référence.
-            #         This is what makes "existing vs new" 100% reliable.
+            #         famille + sous-catégorie + conditionnement + référence,
+            #         narrowed by FOURNISSEUR when the 5-part chaîne carries
+            #         one (two suppliers can sell the same 4-tuple: the
+            #         supplier is what picks the right row). Falls back to the
+            #         supplier-less match for 4-part legacy strings.
             if not cands and line.reference_name and line.famille and line.sous_cat:
-                tax = fetch_one(
+                _tax_sql = (
                     _PROD_COLS
                     + "WHERE p.is_active "
                     "  AND lower(pf.name) = lower(:fam) "
                     "  AND lower(p.subcategory) = lower(:sub) "
                     "  AND p.packaging = :pkg "
                     "  AND p.reference_name = :ref "
-                    "LIMIT 1",
-                    {
-                        "fam": line.famille,
-                        "sub": line.sous_cat,
-                        "pkg": line.conditionnement or "",
-                        "ref": line.reference_name,
-                    },
                 )
+                _tax_params = {
+                    "fam": line.famille,
+                    "sub": line.sous_cat,
+                    "pkg": line.conditionnement or "",
+                    "ref": line.reference_name,
+                }
+                tax = None
+                if line.fournisseur:
+                    tax = fetch_one(
+                        _tax_sql + "  AND lower(s.name) = lower(:sup) LIMIT 1",
+                        {**_tax_params, "sup": line.fournisseur.strip()},
+                    )
+                if tax is None:
+                    tax = fetch_one(_tax_sql + "LIMIT 1", _tax_params)
                 if tax:
                     cands.append(dict(tax))
                     method = "taxonomy"
@@ -501,15 +511,12 @@ elif S["dpgf_step"] == 1:
     product_lines = [ln for ln in lines if ln.row_index in matches]
 
     st.markdown(
-        '<p class="hf-muted" style="font-size:12px;margin:2px 0 8px 0;max-width:780px">'
-        "Une ligne = un produit. Le rapprochement est <b>fiable</b> quand il vient de "
-        "l'<b>identifiant caché</b> (🔗 id) ou de la <b>taxonomie exacte</b> "
-        "(famille · sous-cat · conditionnement · référence) — "
-        "<span style='color:#2e7d52;font-weight:600'>vert = produit existant</span>. "
-        "Un rapprochement <b>approché</b> est en "
-        "<span style='color:#2f6f9f;font-weight:600'>bleu (à vérifier)</span>, "
-        "un <span style='color:#c4623d;font-weight:600'>nouveau produit en orange</span>. "
-        "On ne donne un nouveau prix à un produit existant que sur du vert ou un choix confirmé.</p>",
+        '<p class="hf-muted" style="font-size:12.5px;margin:2px 0 8px 0;max-width:780px">'
+        "Chaque ligne du DPGF a été rapprochée d'un produit du catalogue : "
+        "<span style='color:#2e7d52;font-weight:600'>vert = reconnu</span> · "
+        "<span style='color:#2f6f9f;font-weight:600'>bleu = à confirmer</span> (nom proche, "
+        "vérifie que c'est le bon produit) · "
+        "<span style='color:#c4623d;font-weight:600'>orange = sera créé</span>.</p>",
         unsafe_allow_html=True,
     )
 
@@ -600,26 +607,36 @@ elif S["dpgf_step"] == 1:
             method = m.get("method")
             badge = _METHOD_BADGE.get(method, "") if cat in ("existing", "verify") else ""
 
-            # Money facts to verify: qty · PU client (what we record) · our cost
-            # (AQ) · the margin between them (the whole point of the check).
+            # Money facts, COST FIRST: the primary event of a re-ingestion is
+            # "does the catalogue cost change?". Show current DB cost → new AQ
+            # with an explicit update signal. The PU client (BC — recomputed by
+            # formula from AQ, so it virtually always differs) is secondary
+            # bookkeeping and reads last, muted. Only the zero-margin anomaly
+            # keeps a loud warning.
             qty = (
                 f"{line.quantity:,.2f}".rstrip("0").rstrip(",").replace(",", " ")
                 if line.quantity is not None else "—"
             )
-            marge_txt = ""
-            if line.pu_client and line.pu_fourniture:
-                if line.client_price_differs_from_supplier:
-                    mg = line.pu_client - line.pu_fourniture
-                    mg_pct = (mg / line.pu_fourniture * 100) if line.pu_fourniture else 0
-                    marge_txt = (
-                        f'<span style="color:#2e7d52">marge +{_eur(mg)} '
-                        f'({mg_pct:.0f}%)</span>'
-                    )
-                else:
-                    marge_txt = '<span style="color:#c4623d">⚠ PU = coût (marge nulle)</span>'
-
-            # The → target: the matched product, or what we'll create.
             sel_c = next((c for c in cands if c["id"] == new_sel), None)
+
+            if line.pu_fourniture:
+                _old = sel_c.get("cost_ht") if sel_c else None
+                if _old is not None and abs(float(_old) - float(line.pu_fourniture)) > 0.005:
+                    cost_txt = (
+                        f'coût <span style="text-decoration:line-through">{_eur(_old)}</span> '
+                        f'→ <b style="color:#2e7d52">{_eur(line.pu_fourniture)}</b> '
+                        f'<span style="color:#2e7d52;font-weight:600">✎ sera mis à jour</span>'
+                    )
+                elif _old is not None:
+                    cost_txt = f'coût <b style="color:var(--hf-ink)">{_eur(line.pu_fourniture)}</b> (inchangé)'
+                else:
+                    cost_txt = f'coût <b style="color:var(--hf-ink)">{_eur(line.pu_fourniture)}</b>'
+            else:
+                cost_txt = 'coût — <span style="color:var(--hf-muted)">(pas de Fourniture/U → catalogue intact)</span>'
+
+            warn_txt = ""
+            if line.pu_client and line.pu_fourniture and not line.client_price_differs_from_supplier:
+                warn_txt = '<span style="color:#c4623d">⚠ PU client = coût (marge nulle)</span>'
             if new_sel == "create_new":
                 target = (
                     f'→ <b>nouveau</b> · {line.famille or "?"} · '
@@ -648,20 +665,69 @@ elif S["dpgf_step"] == 1:
                         <span class="hf-chip" style="font-size:9px;padding:1px 6px;background:{tint};color:{border};border:1px solid {border}">{cat_label}</span>
                       </div>
                       <div class="hf-muted" style="font-size:11px;margin-top:3px">
-                        qté {qty} · PU client <b style="color:var(--hf-ink)">{_eur(line.pu_client)}</b>
-                        · coût {_eur(line.pu_fourniture)} {('· ' + marge_txt) if marge_txt else ''}
+                        {cost_txt}{(' · ' + warn_txt) if warn_txt else ''}
                       </div>
                       <div style="font-size:11px;color:var(--hf-body);margin-top:2px">{target}</div>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
+                # Proposition A : tout le secondaire vit ici, à la demande.
+                with st.expander("détails", expanded=False):
+                    _mg_txt = "—"
+                    if line.pu_client and line.pu_fourniture:
+                        _mg = line.pu_client - line.pu_fourniture
+                        _mg_pct = (_mg / line.pu_fourniture * 100) if line.pu_fourniture else 0
+                        _mg_txt = f"+{_eur(_mg)} ({_mg_pct:.0f} %)"
+                    _bd = line.breakdown or {}
+                    _hours_bits = []
+                    if _bd.get("h_appro_u"):
+                        _hours_bits.append(f"appro {_bd['h_appro_u']:.2f} h/u")
+                    if _bd.get("h_pose_u"):
+                        _hours_bits.append(f"pose {_bd['h_pose_u']:.2f} h/u")
+                    if _bd.get("nb_uth"):
+                        _hours_bits.append(f"{_bd['nb_uth']:.0f} pers.")
+                    _rows_html = "".join(
+                        f'<div class="hf-row hf-between" style="font-size:11.5px;padding:2px 0">'
+                        f'<span class="hf-muted">{_lbl}</span><span>{_val}</span></div>'
+                        for _lbl, _val in [
+                            ("Quantité", qty),
+                            ("PU client (prix de vente)", _eur(line.pu_client)),
+                            ("Marge (PU client − coût)", _mg_txt),
+                            ("Temps de pose", " · ".join(_hours_bits) if _hours_bits else "—"),
+                            ("Fournisseur (feuille)", line.fournisseur or "—"),
+                        ]
+                    )
+                    st.markdown(_rows_html, unsafe_allow_html=True)
 
             # ── Inline clarification for create_new lines ──────────────
             if new_sel == "create_new":
                 clar = S["dpgf_clarify"].setdefault(ri, {})
                 auto = _auto_creatable(line)
                 if auto:
+                    # Surface any SILENT taxonomy creation: if the famille (or
+                    # its sous-cat / conditionnement) doesn't exist in the DB
+                    # yet, the commit will create it — say so up front instead
+                    # of letting a typo silently become a new family.
+                    _new_bits = []
+                    _fid_known = lk["family_id_by_name"].get((line.famille or "").strip().lower())
+                    if not _fid_known:
+                        _new_bits.append(f"famille « {line.famille} »")
+                    else:
+                        if line.sous_cat and line.sous_cat not in lk["subs_lookup"].get(_fid_known, []):
+                            _new_bits.append(f"sous-catégorie « {line.sous_cat} »")
+                        elif line.conditionnement and line.conditionnement not in lk["packs_lookup"].get(
+                            (_fid_known, line.sous_cat), []
+                        ):
+                            _new_bits.append(f"conditionnement « {line.conditionnement} »")
+                    if _new_bits:
+                        st.markdown(
+                            '<div class="hf-row" style="gap:6px;margin:2px 0 4px 0">'
+                            + hf_chip("création : " + " + ".join(_new_bits), "warn")
+                            + '<span class="hf-muted" style="font-size:10.5px">sera ajouté au '
+                            "référentiel à l'enregistrement — vérifie l'orthographe</span></div>",
+                            unsafe_allow_html=True,
+                        )
                     exp_label = (
                         f"➕ création auto · {line.famille} · {line.sous_cat} · "
                         f"{line.conditionnement} — corriger ?"
@@ -833,23 +899,18 @@ elif S["dpgf_step"] == 2:
         <div class="hf-card" style="margin:8px 0 12px 0">
           <div class="hf-row hf-between">
             <div class="hf-row" style="gap:10px;flex-wrap:wrap">
-              <h2 class="hf-h2" style="margin:0">Récap de l'écriture</h2>
-              {hf_chip(f"{n_match} produits à mettre à jour", "ok")}
-              {hf_chip(f"{n_create} produits à créer", "warn")}
-              {hf_chip(f"{n_distinct_client} PU client (rouge)", "danger" if n_distinct_client else "ghost")}
+              <h2 class="hf-h2" style="margin:0">Ce qui sera enregistré</h2>
+              {hf_chip(f"{n_match} coûts fournisseur mis à jour", "ok")}
+              {hf_chip(f"{n_create} nouveaux produits", "warn")}
+              {hf_chip(f"{n_distinct_client} prix de vente historisés", "ghost")}
             </div>
             <div class="hf-mono" style="font-size:12px;color:var(--hf-ink);font-weight:600">
               {n_ready} ligne(s) prête(s)
             </div>
           </div>
-          <div class="hf-muted" style="font-size:11.5px;margin-top:8px;line-height:1.55">
-            ↳ <b>Coût HT</b> du produit mis à jour avec le coût fournisseur (col. AQ) — tracé en
-            <b>noir</b> <code style="font-family:JetBrains Mono,monospace;background:var(--hf-cream);padding:1px 5px;border-radius:3px;font-size:10.5px">dpgf_return</code>.<br>
-            ↳ <b>PU client accepté</b> (col. BC) enregistré en <b>rouge</b>
-            <code style="font-family:JetBrains Mono,monospace;background:var(--hf-cream);padding:1px 5px;border-radius:3px;font-size:10.5px">dpgf_client_price</code>
-            avec le <b>détail des coefficients</b>, rattaché au projet.<br>
-            ↳ Le <b>fichier .xlsx</b> et les <b>stats de rentabilité</b> du projet sont conservés (voir « Pilotage de rentabilité » en bas de cette page).<br>
-            ↳ Les <b>nouveaux produits</b> utilisent la taxonomie / fournisseur / norme précisés à l'étape précédente.
+          <div class="hf-muted" style="font-size:12px;margin-top:8px;line-height:1.6">
+            Le <b>coût fournisseur</b> (AQ) met à jour le catalogue ; le <b>prix de vente client</b>
+            est seulement archivé dans l'historique — il ne modifie jamais le prix catalogue.
           </div>
         </div>
         """,
@@ -922,7 +983,7 @@ elif S["dpgf_step"] == 2:
                   <div style="font-size:18px;font-weight:700;color:var(--hf-ink)">{_fmt_money(canon.get('marge_eur'))}
                     <span style="font-size:12px;font-weight:600;color:var(--hf-muted)">{f"· {marge_pct:.1f}%" if isinstance(marge_pct, (int, float)) else ""}</span></div></div>
                 <div><div class="hf-muted" style="font-size:10.5px">KV (vente / revient)</div>
-                  <div style="font-size:18px;font-weight:700;color:var(--hf-accent)">{f"{kv:.3f}" if isinstance(kv, (int, float)) else "—"}</div></div>
+                  <div style="font-size:18px;font-weight:700;color:var(--hf-leaf,#3a7d52)">{f"{kv:.3f}" if isinstance(kv, (int, float)) else "—"}</div></div>
               </div>
               {hors_html}
               {plan_html}
@@ -955,7 +1016,7 @@ elif S["dpgf_step"] == 2:
             "→ Produit": f"{prod['reference_name']} · {prod['family_name']} · {prod['packaging']}",
             "Coût HT (AQ)": _fmt_eur(cost_used),
             "PU client (BC)": _fmt_eur(line.pu_client),
-            "PU client (rouge)": ("🔴 oui" if _should_log_client(line) else "—"),
+            "Prix de vente historisé": ("oui" if _should_log_client(line) else "—"),
         })
     for line in create_lines:
         clar = S["dpgf_clarify"].get(line.row_index, {})
@@ -982,7 +1043,7 @@ elif S["dpgf_step"] == 2:
             "→ Produit": new_label,
             "Coût HT (AQ)": _fmt_eur(cost_used),
             "PU client (BC)": _fmt_eur(line.pu_client),
-            "PU client (rouge)": ("🔴 oui" if _should_log_client(line) else "—"),
+            "Prix de vente historisé": ("oui" if _should_log_client(line) else "—"),
         })
 
     if summary_rows:
@@ -1016,6 +1077,7 @@ elif S["dpgf_step"] == 2:
                 n_updated = 0
                 n_created = 0
                 n_validated = 0
+                n_cost_skipped = 0   # matched lines with no AQ → cost untouched
                 with transaction(ingestion_source="dpgf_return", ingestion_actor=actor) as conn:
 
                     # ── 0. Persist the project (xlsx + stats), get its id ──
@@ -1065,22 +1127,25 @@ elif S["dpgf_step"] == 2:
 
                     # ── 1. Update existing matched products ──────────
                     for line, pid in match_lines:
-                        # Supplier cost (AQ) → falls back to client PU.
-                        new_cost = (
-                            float(line.pu_fourniture)
-                            if line.pu_fourniture else float(line.pu_client)
-                        )
-                        # The trigger logs a 'dpgf_return' (black) row stamped
-                        # with project_id from set_config — only if cost changed.
-                        conn.execute(
-                            text(
-                                "UPDATE products SET cost_ht = :cost, "
-                                "last_price_update = now() "
-                                "WHERE id = :pid"
-                            ),
-                            {"cost": new_cost, "pid": pid},
-                        )
-                        n_updated += 1
+                        # Cost = supplier price (AQ) ONLY. The DB stores costs,
+                        # never selling prices: a line without AQ leaves the
+                        # product's cost untouched (the BC selling price is
+                        # still historised below). Letting BC fall through here
+                        # would poison cost_ht with a margined client price.
+                        if line.pu_fourniture:
+                            # The trigger logs a 'dpgf_return' (black) row
+                            # stamped with project_id — only if cost changed.
+                            conn.execute(
+                                text(
+                                    "UPDATE products SET cost_ht = :cost, "
+                                    "last_price_update = now() "
+                                    "WHERE id = :pid"
+                                ),
+                                {"cost": float(line.pu_fourniture), "pid": pid},
+                            )
+                            n_updated += 1
+                        else:
+                            n_cost_skipped += 1
 
                         # Client PU (BC) → 'dpgf_client_price' (red) row with the
                         # full coefficient breakdown + project link.
@@ -1126,9 +1191,9 @@ elif S["dpgf_step"] == 2:
                                     clar.get("labor_new_unit", "u"),
                                     clar.get("labor_new_pose_hours") or 0,
                                 )
-                            new_cost = float(
-                                clar.get("cost") or line.pu_fourniture or line.pu_client or 0
-                            )
+                            # Cost = clarified value or AQ. NEVER the client PU
+                            # (BC is a margined selling price, not a cost).
+                            new_cost = float(clar.get("cost") or line.pu_fourniture or 0)
                             unit = line.unit or clar.get("labor_new_unit") or "u"
                         else:
                             # Auto from the parsed picker (complete triplet).
@@ -1144,7 +1209,7 @@ elif S["dpgf_step"] == 2:
                                 if sup_row:
                                     supplier_id = int(sup_row["id"])
                             labor_id = _default_labor_id
-                            new_cost = float(line.pu_fourniture or line.pu_client or 0)
+                            new_cost = float(line.pu_fourniture or 0)  # AQ only, never BC
                             unit = line.unit or "u"
 
                         # Guarantee the NOT NULL FKs (supplier + labor norm).
@@ -1241,12 +1306,17 @@ elif S["dpgf_step"] == 2:
 
                 msg = (
                     f"✓ Projet enregistré (#{project_id}) · "
-                    f"{n_updated} produit(s) mis à jour · "
+                    f"{n_updated} coût(s) fournisseur mis à jour · "
                     f"{n_created} produit(s) créé(s) · "
-                    f"{n_validated} prix client (rouge) enregistré(s). "
-                    f"Le fichier .xlsx et les stats sont conservés (Pilotage de rentabilité, en bas de cette page)."
+                    f"{n_validated} prix de vente historisé(s). "
+                    f"Le fichier .xlsx et la rentabilité sont conservés (en bas de cette page)."
                 )
                 st.success(msg)
+                if n_cost_skipped:
+                    st.info(
+                        f"ℹ️ {n_cost_skipped} ligne(s) sans coût fournisseur (col. AQ vide) : "
+                        "le coût du produit n'a pas été modifié — seul le prix de vente a été historisé."
+                    )
                 _reset()
                 st.balloons()
             except Exception as exc:
@@ -1328,8 +1398,8 @@ def _detail_block(title: str, rows: list) -> str:
     )
     return (
         '<div style="border:1px solid var(--hf-border-soft);border-radius:6px;overflow:hidden">'
-        '<div style="background:var(--hf-accent);color:#fff;font-weight:700;'
-        'font-size:10.5px;padding:4px 8px;letter-spacing:.02em">' + title + "</div>"
+        '<div style="background:var(--hf-green,#1d3a2a);color:#fff;font-weight:700;'
+        'font-size:10.5px;padding:5px 8px;letter-spacing:.02em">' + title + "</div>"
         + body + "</div>"
     )
 
@@ -1498,7 +1568,7 @@ def _render_rentabilite() -> None:
             with c_kv:
                 st.markdown(
                     '<div class="hf-muted" style="font-size:9.5px">KV</div>'
-                    f'<div style="font-weight:700;font-size:15px;color:var(--hf-accent)">'
+                    f'<div style="font-weight:700;font-size:15px;color:var(--hf-leaf,#3a7d52)">'
                     f'{f"{kv:.3f}".replace(".", ",") if kv is not None else "—"}</div>',
                     unsafe_allow_html=True,
                 )
@@ -1590,7 +1660,9 @@ def _render_rentabilite() -> None:
                     )
 
 
-if S["dpgf_step"] == 0:
+# S.get: after a successful commit, _reset() pops dpgf_step within this same
+# script run, so a bare S["dpgf_step"] here raises KeyError (seen in prod logs).
+if S.get("dpgf_step", 0) == 0:
     _render_rentabilite()
 
 
