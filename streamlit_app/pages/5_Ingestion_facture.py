@@ -297,6 +297,7 @@ def _reset() -> None:
         "ing_step", "ing_file_path", "ing_file_hash", "ing_pdf_bytes",
         "ing_extracted", "ing_queue_ids", "ing_match_results", "ing_lines_state",
         "ing_supplier_choice", "active_line_idx", "ing_commit_requested",
+        "ing_batch", "ing_batch_idx",
     ]:
         S.pop(k, None)
 
@@ -304,12 +305,154 @@ def _reset() -> None:
 # ============================================================================
 #  Step A & B — Upload + Extract
 # ============================================================================
+def _extract_one(name: str, raw: bytes, *, labor_norms, families,
+                 family_id_by_name_lower) -> dict | None:
+    """Analyse ONE invoice → a self-contained review payload (or None on failure).
+
+    Same pipeline as the historical single-PDF flow — extraction, persistence to
+    the queue, matching, initial per-line status. Returning a payload (instead of
+    writing session state directly) is what lets a whole batch be analysed up
+    front and then reviewed one invoice at a time in the SAME relecture screen.
+    """
+    sha = hashlib.sha256(raw).hexdigest()
+    file_path, _ = _save_pdf_bytes(name, raw)
+    try:
+        extracted = extract_invoice(
+            raw,
+            labor_norm_names=[ln["task_name"] for ln in labor_norms],
+            family_names=[f["name"] for f in families],
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Catch-all: auth/quota/network errors are NOT ExtractionError and used
+        # to explode as a raw traceback. Trace the failure in the queue and let
+        # the batch continue with the next file.
+        engine = get_engine()
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO ingestion_queue
+                        (source, source_reference, raw_payload, status, review_notes)
+                    VALUES
+                        (:src, :ref, CAST(:payload AS jsonb), 'needs_info', :notes)
+                    """
+                ),
+                {
+                    "src": INGESTION_SOURCE,
+                    "ref": file_path.name,
+                    "payload": json.dumps(
+                        {
+                            "_invoice_sha256": sha,
+                            "_error": str(exc),
+                            "_raw_response": getattr(exc, "raw_response", None),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "notes": f"Extraction failure: {exc}"[:500],
+                },
+            )
+        st.error(f"« {name} » — échec de l'analyse : {type(exc).__name__}: {exc}")
+        return None
+
+    queue_ids = _persist_extraction(extracted, file_path=file_path, file_hash=sha)
+
+    match_results: list[dict] = []
+    for li in extracted.line_items:
+        if not li.is_product_line:
+            match_results.append({"action": "skip", "product_id": None,
+                                  "confidence": 0.0, "reasoning": "Non-product line (Gemini)"})
+            continue
+        result = match({
+            "reference_name": li.reference_name or li.designation_raw,
+            "family_id": family_id_by_name_lower.get((li.family_hint or "").lower()),
+            "subcategory": li.subcategory,
+            "packaging": li.packaging,
+            "unit_type": li.unit_type_normalized,
+            "brand": li.brand,
+            "material": li.material,
+            "attributes": li.attributes or {},
+        })
+        match_results.append({"action": result.action, "product_id": result.product_id,
+                              "confidence": result.confidence, "reasoning": result.reasoning})
+
+    lines_state: list[dict] = []
+    for li, mr in zip(extracted.line_items, match_results):
+        cost = float(li.unit_price_ht) if li.unit_price_ht else 0.0
+        if not li.is_product_line:
+            initial_status = "Rejeter"
+        elif mr["action"] in {"auto-match", "match"} and cost > 0:
+            initial_status = "Approuver"
+        else:
+            initial_status = "À décider"
+        lines_state.append({
+            "status": initial_status,
+            "reference_name": li.reference_name or "",
+            "family_hint": li.family_hint or "",
+            "brand": li.brand or "",
+            "material": li.material or "",
+            "packaging": li.packaging or "",
+            "unit_type": li.unit_type_normalized or "u",
+            "cost_ht": cost,
+            "attributes": dict(li.attributes or {}),
+            "matched_product_id": mr["product_id"],
+            "suggested_labor_task": li.suggested_labor_task,
+            "subcategory": li.subcategory or "",
+        })
+
+    n_prod = sum(1 for li in extracted.line_items if li.is_product_line)
+    return {
+        "name": name,
+        "file_path": str(file_path),
+        "sha": sha,
+        "extracted": json.loads(extracted.model_dump_json()),
+        "queue_ids": queue_ids,
+        "match_results": match_results,
+        "lines_state": lines_state,
+        "supplier_choice": None,
+        "done": False,
+        "n_product_lines": n_prod,
+    }
+
+
+def _load_batch_item(idx: int) -> None:
+    """Make invoice `idx` of the batch the one the relecture screen edits.
+
+    The payload objects are stored BY REFERENCE, so edits made in the review UI
+    (lines_state) persist when navigating between invoices.
+    """
+    it = S["ing_batch"][idx]
+    S["ing_batch_idx"] = idx
+    S["ing_file_path"] = it["file_path"]
+    S["ing_file_hash"] = it["sha"]
+    S["ing_pdf_bytes"] = None          # re-read lazily from disk by the viewer
+    S["ing_extracted"] = it["extracted"]
+    S["ing_queue_ids"] = it["queue_ids"]
+    S["ing_match_results"] = it["match_results"]
+    S["ing_lines_state"] = it["lines_state"]
+    S["ing_supplier_choice"] = it.get("supplier_choice")
+    S["active_line_idx"] = 0
+    # The supplier selectbox is keyed; drop it so it re-inits per invoice.
+    S.pop("ing_sup_select", None)
+
+
+def _stash_current_batch_item() -> None:
+    """Persist per-invoice UI choices before switching invoice."""
+    if S.get("ing_batch") and S.get("ing_batch_idx") is not None:
+        try:
+            S["ing_batch"][int(S["ing_batch_idx"])]["supplier_choice"] = S.get("ing_supplier_choice")
+        except (IndexError, ValueError, TypeError):
+            pass
+
+
+# ============================================================================
+#  Step A & B — Upload + Extract (batch-aware: analyse all, review one by one)
+# ============================================================================
 if S["ing_step"] == "upload":
     render_header(title="Ingestion facture", subtitle="étape 1 / 4 · dépôt")
     hf_stepper(["Dépôt", "Extraction", "Relecture", "Valider"], current_idx=0)
 
     uploads = st.file_uploader(
-        "Choisissez un ou plusieurs PDF (ou un .zip de devis/factures)",
+        "Choisissez une ou plusieurs factures PDF (ou un .zip)",
         type=["pdf", "zip"],
         accept_multiple_files=True,
     )
@@ -331,207 +474,92 @@ if S["ing_step"] == "upload":
         else:
             batch_files.append((up.name, up.getvalue()))
 
-    # ── BATCH MODE (several PDFs): extract each one sequentially, park every
-    #    line in the file d'attente, review on the page « À classifier ».
-    #    One bad PDF never interrupts the batch.
-    if len(batch_files) > 1:
-        st.markdown(
-            f'<p class="hf-muted" style="font-size:12.5px">**{len(batch_files)} PDF** détectés — '
-            "mode lot : chaque document est analysé puis envoyé dans la file d'attente "
-            "(page <b>À classifier → Ingestion en attente</b>) pour relecture.</p>",
-            unsafe_allow_html=True,
-        )
-        if st.button(f"Analyser les {len(batch_files)} PDF", type="primary"):
-            labor_norms = fetch_all("SELECT task_name FROM labor_norms ORDER BY task_name")
-            families = fetch_all("SELECT id, name FROM product_families ORDER BY name")
-            prog = st.progress(0.0)
-            report: list[str] = []
-            for i, (fname, fraw) in enumerate(batch_files):
-                prog.progress(i / len(batch_files), text=f"{fname} ({i + 1}/{len(batch_files)})")
-                fsha = hashlib.sha256(fraw).hexdigest()
-                if _check_duplicate(fsha):
-                    report.append(f"⏭ {fname} — déjà ingéré, sauté")
-                    continue
-                try:
-                    fpath, _ = _save_pdf_bytes(fname, fraw)
-                    extracted_b = extract_invoice(
-                        fraw,
-                        labor_norm_names=[ln["task_name"] for ln in labor_norms],
-                        family_names=[f["name"] for f in families],
-                    )
-                    qids = _persist_extraction(extracted_b, file_path=fpath, file_hash=fsha)
-                    report.append(f"✓ {fname} — {len(qids)} ligne(s) en file d'attente")
-                except Exception as exc:  # noqa: BLE001 — a bad file must not kill the batch
-                    report.append(f"✗ {fname} — échec : {type(exc).__name__}: {str(exc)[:140]}")
-                # Small pause between Gemini calls to stay clear of rate limits.
-                time.sleep(2)
-            prog.progress(1.0, text="Terminé")
-            ok = sum(1 for r in report if r.startswith("✓"))
-            st.success(f"Lot terminé : {ok}/{len(batch_files)} PDF analysés.")
-            for r in report:
-                st.markdown(f"- {r}")
-            st.info("Relecture et validation : page **À classifier → Ingestion en attente**.")
-        st.stop()
+    if batch_files:
+        n_files = len(batch_files)
+        first_name, first_raw = batch_files[0]
 
-    uploaded = uploads[0] if len(batch_files) == 1 and uploads and not uploads[0].name.lower().endswith(".zip") else None
-    if len(batch_files) == 1 and uploaded is None:
-        # Single PDF that came out of a zip: wrap it for the interactive flow.
-        _zn, _zb = batch_files[0]
-        uploaded = io.BytesIO(_zb)
-        uploaded.name = _zn  # type: ignore[attr-defined]
-    if uploaded is not None:
-        raw = uploaded.getvalue()
-        sha = hashlib.sha256(raw).hexdigest()
-        dup = _check_duplicate(sha)
-        if dup:
-            st.warning(
-                f"Cette facture (SHA-256 : `{sha[:12]}…`) a déjà été ingérée le "
-                f"{dup['created_at'].strftime('%Y-%m-%d')} (référence `{dup['source_reference']}`, "
-                f"statut « {dup['status']} »). Téléversez-la quand même uniquement si vous savez ce que vous faites."
+        if n_files > 1:
+            st.markdown(
+                f'<div class="hf-card" style="padding:12px 14px;margin:4px 0 12px 0">'
+                f'<b>{n_files} factures détectées.</b> '
+                '<span class="hf-muted">Elles vont être analysées les unes après les '
+                "autres, puis tu les relis <b>une par une</b> — chacune avec son PDF "
+                "à côté, comme pour une facture seule.</span></div>",
+                unsafe_allow_html=True,
             )
+            with st.expander(f"Voir les {n_files} fichiers", expanded=False):
+                for _n, _b in batch_files:
+                    st.markdown(
+                        f'<div class="hf-muted" style="font-size:11.5px">• {_n} '
+                        f"· {len(_b) / 1024:.0f} Ko</div>",
+                        unsafe_allow_html=True,
+                    )
+
+        # Duplicate check on every file, surfaced before spending Gemini calls.
+        dups = [(n, _check_duplicate(hashlib.sha256(b).hexdigest())) for n, b in batch_files]
+        dups = [(n, d) for n, d in dups if d]
+        if dups:
+            st.warning(
+                "Déjà ingérée(s) : "
+                + ", ".join(f"**{n}** (le {d['created_at'].strftime('%d/%m/%Y')})" for n, d in dups)
+                + ". Elles seront ré-analysées si tu continues."
+            )
+
         col_p, col_a = st.columns([2, 1])
         with col_p:
-            _render_pdf_preview(raw)
-        with col_a:
-            st.write(f"**Nom** : {uploaded.name}")
-            st.write(f"**Taille** : {len(raw) / 1024:.1f} KB")
-            st.write(f"**SHA-256** : `{sha[:16]}…`")
-            if st.button("Extraire avec Gemini", type="primary", use_container_width=True):
-                tracker = StepTracker(
-                    [
-                        "Préparation de l'espace de travail",
-                        "Lecture du PDF",
-                        "Envoi à Gemini (extraction LLM)",
-                        "Parsing et validation de la réponse",
-                        "Matching avec produits existants",
-                        "Préparation de la relecture",
-                    ],
-                    status_label="Traitement en cours…",
+            _render_pdf_preview(first_raw)
+            if n_files > 1:
+                st.markdown(
+                    '<div class="hf-muted" style="font-size:11px;text-align:center">'
+                    f"aperçu de la 1ʳᵉ facture · {first_name}</div>",
+                    unsafe_allow_html=True,
                 )
-
-                tracker.activate(0, fill=2)
-                file_path, _ = _save_pdf(uploaded)
+        with col_a:
+            st.write(f"**Fichiers** : {n_files}")
+            st.write(f"**Poids total** : {sum(len(b) for _, b in batch_files) / 1024:.0f} Ko")
+            btn_label = (
+                "Analyser avec Gemini" if n_files == 1
+                else f"Analyser les {n_files} factures"
+            )
+            if st.button(btn_label, type="primary", use_container_width=True):
                 labor_norms = fetch_all("SELECT task_name FROM labor_norms ORDER BY task_name")
                 families = fetch_all("SELECT id, name FROM product_families ORDER BY name")
                 family_id_by_name_lower = {f["name"].lower(): f["id"] for f in families}
-                tracker.complete(0)
 
-                tracker.activate(1, fill=4)
-                time.sleep(0.15)
-                tracker.complete(1)
-
-                tracker.activate(2, fill=2)
-                try:
-                    extracted = extract_invoice(
-                        raw,
-                        labor_norm_names=[ln["task_name"] for ln in labor_norms],
-                        family_names=[f["name"] for f in families],
+                batch: list[dict] = []
+                prog = st.progress(0.0, text="Analyse en cours…")
+                for _i, (_name, _raw) in enumerate(batch_files):
+                    prog.progress(
+                        _i / n_files,
+                        text=f"Analyse {_i + 1}/{n_files} · {_name}",
                     )
-                except Exception as exc:  # noqa: BLE001
-                    # Catch-all on purpose: auth/quota/network errors are NOT
-                    # ExtractionError and used to explode as a raw traceback in
-                    # the UI (seen in prod). Everything lands here as a clean
-                    # French message + a needs_info trace row.
-                    tracker.fail(2, status_label="Échec de l'extraction.")
-                    if isinstance(exc, ExtractionError):
-                        st.error(f"Échec de l'extraction Gemini : {exc}")
-                    else:
-                        st.error(
-                            "Échec de l'analyse du PDF (erreur technique, pas le contenu "
-                            f"du document) : {type(exc).__name__}: {exc}"
+                    item = _extract_one(
+                        _name, _raw,
+                        labor_norms=labor_norms, families=families,
+                        family_id_by_name_lower=family_id_by_name_lower,
+                    )
+                    if item:
+                        batch.append(item)
+                    # Small pause between Gemini calls to stay clear of quotas.
+                    if _i < n_files - 1:
+                        time.sleep(1.5)
+                prog.progress(1.0, text="Analyse terminée.")
+
+                if not batch:
+                    st.error(
+                        "Aucune facture n'a pu être analysée. Les échecs sont tracés "
+                        "dans la file d'attente (page À classifier)."
+                    )
+                else:
+                    if len(batch) < n_files:
+                        st.warning(
+                            f"{n_files - len(batch)} facture(s) en échec — les "
+                            f"{len(batch)} autres passent en relecture."
                         )
-                    engine = get_engine()
-                    with engine.begin() as conn:
-                        conn.execute(
-                            text(
-                                """
-                                INSERT INTO ingestion_queue
-                                    (source, source_reference, raw_payload, status, review_notes)
-                                VALUES
-                                    (:src, :ref, CAST(:payload AS jsonb), 'needs_info', :notes)
-                                """
-                            ),
-                            {
-                                "src": INGESTION_SOURCE,
-                                "ref": file_path.name,
-                                "payload": json.dumps(
-                                    {
-                                        "_invoice_sha256": sha,
-                                        "_error": str(exc),
-                                        "_raw_response": getattr(exc, "raw_response", None),
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                                "notes": f"Extraction failure: {exc}"[:500],
-                            },
-                        )
-                    st.info("Une entrée `needs_info` a été créée dans la file d'attente.")
-                    st.stop()
-                tracker.complete(2)
-
-                tracker.activate(3, fill=3)
-                queue_ids = _persist_extraction(extracted, file_path=file_path, file_hash=sha)
-                tracker.complete(3)
-
-                tracker.activate(4, fill=1)
-                match_results: list[dict] = []
-                for li in extracted.line_items:
-                    if not li.is_product_line:
-                        match_results.append({"action": "skip", "product_id": None,
-                                              "confidence": 0.0, "reasoning": "Non-product line (Gemini)"})
-                        continue
-                    query = {
-                        "reference_name": li.reference_name or li.designation_raw,
-                        "family_id": family_id_by_name_lower.get((li.family_hint or "").lower()),
-                        "subcategory": li.subcategory,
-                        "packaging": li.packaging,
-                        "unit_type": li.unit_type_normalized,
-                        "brand": li.brand,
-                        "material": li.material,
-                        "attributes": li.attributes or {},
-                    }
-                    result = match(query)
-                    match_results.append({"action": result.action, "product_id": result.product_id,
-                                          "confidence": result.confidence, "reasoning": result.reasoning})
-                tracker.complete(4)
-
-                tracker.activate(5, fill=4)
-                lines_state: list[dict] = []
-                for li, mr in zip(extracted.line_items, match_results):
-                    cost = float(li.unit_price_ht) if li.unit_price_ht else 0.0
-                    if not li.is_product_line:
-                        initial_status = "Rejeter"
-                    elif mr["action"] in {"auto-match", "match"} and cost > 0:
-                        initial_status = "Approuver"
-                    else:
-                        initial_status = "À décider"
-                    lines_state.append({
-                        "status": initial_status,
-                        "reference_name": li.reference_name or "",
-                        "family_hint": li.family_hint or "",
-                        "brand": li.brand or "",
-                        "material": li.material or "",
-                        "packaging": li.packaging or "",
-                        "unit_type": li.unit_type_normalized or "u",
-                        "cost_ht": cost,
-                        "attributes": dict(li.attributes or {}),
-                        "matched_product_id": mr["product_id"],
-                        "suggested_labor_task": li.suggested_labor_task,
-                        "subcategory": li.subcategory or "",
-                    })
-                tracker.finish(status_label="Prêt pour relecture.")
-                time.sleep(0.4)
-
-                S["ing_file_path"] = str(file_path)
-                S["ing_file_hash"] = sha
-                S["ing_pdf_bytes"] = raw
-                S["ing_extracted"] = json.loads(extracted.model_dump_json())
-                S["ing_queue_ids"] = queue_ids
-                S["ing_match_results"] = match_results
-                S["ing_lines_state"] = lines_state
-                S["ing_step"] = "review"
-                S["active_line_idx"] = 0
-                st.rerun()
+                    S["ing_batch"] = batch
+                    _load_batch_item(0)
+                    S["ing_step"] = "review"
+                    st.rerun()
 
 
 # ============================================================================
@@ -543,7 +571,16 @@ if S["ing_step"] == "review":
     match_results = S["ing_match_results"]
     lines_state = S["ing_lines_state"]
     line_items_raw = extracted["line_items"]
-    n_lines = len(line_items_raw)
+    # Les lignes non-produit (totaux, TVA, remises, en-têtes) ne sont pas des
+    # prix : les afficher en relecture est du bruit pur. On GARDE les tableaux
+    # complets (la logique de commit les indexe) mais toute l'UI est pilotée
+    # par `visible_idx`.
+    visible_idx = [
+        _i for _i, _li in enumerate(line_items_raw)
+        if _li.get("is_product_line", True)
+    ]
+    n_hidden = len(line_items_raw) - len(visible_idx)
+    n_lines = len(visible_idx)
     sup = extracted.get("supplier") or {}
     sup_name = (sup.get("name") or "").strip()
 
@@ -594,7 +631,8 @@ if S["ing_step"] == "review":
 
     # ---- Aggregate counts for top bar ----
     ready_count = blocked_count = rejected_count = undecided_count = 0
-    for ls in lines_state:
+    for _vi in visible_idx:
+        ls = lines_state[_vi]
         status = ls.get("status") or "À décider"
         cost = float(ls.get("cost_ht") or 0)
         # An inline "+ créer nouveau…" famille / norme isn't ready until its
@@ -633,6 +671,35 @@ if S["ing_step"] == "review":
         f"<span class='sep'>·</span> sha {sha_short}…"
     )
 
+    # ── Navigateur de lot : une facture à la fois, dans CE même écran ──
+    _batch = S.get("ing_batch") or []
+    if len(_batch) > 1:
+        _bi = int(S.get("ing_batch_idx") or 0)
+        _n_done = sum(1 for _it in _batch if _it.get("done"))
+        nav_l, nav_c, nav_r = st.columns([1, 3, 1])
+        with nav_l:
+            if st.button("← facture précédente", disabled=(_bi == 0),
+                         use_container_width=True, key="ing_batch_prev"):
+                _stash_current_batch_item()
+                _load_batch_item(_bi - 1)
+                st.rerun()
+        with nav_c:
+            st.markdown(
+                '<div style="text-align:center">'
+                f'<div style="font-weight:600;font-size:13px;color:var(--hf-ink)">'
+                f'Facture {_bi + 1} / {len(_batch)}</div>'
+                f'<div class="hf-muted" style="font-size:11px">{_batch[_bi]["name"]} · '
+                f'{_n_done} validée(s)</div></div>',
+                unsafe_allow_html=True,
+            )
+        with nav_r:
+            if st.button("facture suivante →", disabled=(_bi >= len(_batch) - 1),
+                         use_container_width=True, key="ing_batch_next"):
+                _stash_current_batch_item()
+                _load_batch_item(_bi + 1)
+                st.rerun()
+        st.progress(_n_done / len(_batch))
+
     hdr_l, hdr_r = st.columns([3, 2])
     with hdr_l:
         render_header(
@@ -652,6 +719,9 @@ if S["ing_step"] == "review":
     )
     if blocked_count:
         chips_html += hf_chip(f"⚠ {blocked_count} bloquées", "danger")
+    if n_hidden:
+        # Transparence : on dit combien de lignes ont été écartées, sans les afficher.
+        chips_html += hf_chip(f"{n_hidden} non-produit ignorées", "ghost")
     chips_html += "</div>"
     st.markdown(chips_html, unsafe_allow_html=True)
 
@@ -700,9 +770,9 @@ if S["ing_step"] == "review":
     if "active_line_idx" not in S:
         S["active_line_idx"] = 0
     active_idx = int(S["active_line_idx"])
-    if active_idx >= n_lines:
-        active_idx = 0
-        S["active_line_idx"] = 0
+    if active_idx not in visible_idx:
+        active_idx = visible_idx[0] if visible_idx else 0
+        S["active_line_idx"] = active_idx
 
     # ---- COLUMNS: list | editor [| invoice] ----
     if show_pdf:
@@ -718,7 +788,8 @@ if S["ing_step"] == "review":
             unsafe_allow_html=True,
         )
         st.markdown('<div class="hf-line-list-wrapper">', unsafe_allow_html=True)
-        for i, (li, mr, ls) in enumerate(zip(line_items_raw, match_results, lines_state)):
+        for _pos, i in enumerate(visible_idx):
+            li, mr, ls = line_items_raw[i], match_results[i], lines_state[i]
             status = ls.get("status") or "À décider"
             cost = float(ls.get("cost_ht") or 0)
             triplet_ok = (
@@ -738,7 +809,7 @@ if S["ing_step"] == "review":
                 or f"ligne {i+1}"
             )
             desig_short = desig if len(desig) <= 30 else (desig[:28] + "…")
-            label = f"{i+1:02d}  {dot}  {desig_short}"
+            label = f"{_pos+1:02d}  {dot}  {desig_short}"
             btn_type = "primary" if i == active_idx else "secondary"
             if st.button(label, key=f"line_btn_{i}", use_container_width=True, type=btn_type):
                 S["active_line_idx"] = i
@@ -1297,12 +1368,31 @@ if S["ing_step"] == "review":
                         },
                     )
 
-            st.success(
-                f"✓ {created} produit(s) créé(s), {updated} mis à jour, {rejected} ligne(s) rejetée(s). "
-                "→ Voir la page **Produits**."
-            )
-            _reset()
-            st.balloons()
+            _batch_all = S.get("ing_batch") or []
+            if _batch_all:
+                try:
+                    _batch_all[int(S.get("ing_batch_idx") or 0)]["done"] = True
+                except (IndexError, ValueError, TypeError):
+                    pass
+            _next = next((k for k, _it in enumerate(_batch_all) if not _it.get("done")), None)
+            if _next is not None:
+                # Enchaîne sur la facture suivante du lot : même écran, même tampon.
+                st.success(
+                    f"✓ {created} produit(s) créé(s), {updated} mis à jour, "
+                    f"{rejected} rejetée(s) — passage à la facture {_next + 1}/{len(_batch_all)}."
+                )
+                _load_batch_item(_next)
+                S["ing_step"] = "review"
+                time.sleep(1.0)
+                st.rerun()
+            else:
+                st.success(
+                    f"✓ {created} produit(s) créé(s), {updated} mis à jour, {rejected} ligne(s) rejetée(s). "
+                    + ("Lot terminé — toutes les factures ont été validées. " if _batch_all else "")
+                    + "→ Voir la page **Produits**."
+                )
+                _reset()
+                st.balloons()
         except Exception as exc:
             log.exception("Commit failed")
             st.error(f"Échec du commit : {exc}")
