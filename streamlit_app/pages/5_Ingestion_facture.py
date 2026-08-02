@@ -298,6 +298,8 @@ def _reset() -> None:
         "ing_extracted", "ing_queue_ids", "ing_match_results", "ing_lines_state",
         "ing_supplier_choice", "active_line_idx", "ing_commit_requested",
         "ing_batch", "ing_batch_idx",
+        "ing_analyze_queue", "ing_analyze_done", "ing_analyze_failed",
+        "ing_analyze_total",
     ]:
         S.pop(k, None)
 
@@ -315,7 +317,14 @@ def _extract_one(name: str, raw: bytes, *, labor_norms, families,
     front and then reviewed one invoice at a time in the SAME relecture screen.
     """
     sha = hashlib.sha256(raw).hexdigest()
-    file_path, _ = _save_pdf_bytes(name, raw)
+    # Étape "sauvegarde" hors du try principal : si /data/invoices n'est pas
+    # inscriptible, on doit le dire au lieu de laisser l'exception tuer le lot.
+    try:
+        file_path, _ = _save_pdf_bytes(name, raw)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Saving %s failed", name)
+        st.error(f"« {name} » — impossible d'enregistrer le PDF : {exc}")
+        return None
     try:
         extracted = extract_invoice(
             raw,
@@ -354,26 +363,39 @@ def _extract_one(name: str, raw: bytes, *, labor_norms, families,
         st.error(f"« {name} » — échec de l'analyse : {type(exc).__name__}: {exc}")
         return None
 
-    queue_ids = _persist_extraction(extracted, file_path=file_path, file_hash=sha)
+    try:
+        queue_ids = _persist_extraction(extracted, file_path=file_path, file_hash=sha)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Persisting %s failed", name)
+        st.error(f"« {name} » — enregistrement en file d'attente impossible : {exc}")
+        return None
 
+    # Le matching peut lui aussi appeler le LLM (désambiguïsation) : une erreur
+    # de quota ne doit PAS faire tomber la facture entière — on retombe sur
+    # "nouveau produit" et l'humain tranchera en relecture.
     match_results: list[dict] = []
     for li in extracted.line_items:
         if not li.is_product_line:
             match_results.append({"action": "skip", "product_id": None,
                                   "confidence": 0.0, "reasoning": "Non-product line (Gemini)"})
             continue
-        result = match({
-            "reference_name": li.reference_name or li.designation_raw,
-            "family_id": family_id_by_name_lower.get((li.family_hint or "").lower()),
-            "subcategory": li.subcategory,
-            "packaging": li.packaging,
-            "unit_type": li.unit_type_normalized,
-            "brand": li.brand,
-            "material": li.material,
-            "attributes": li.attributes or {},
-        })
-        match_results.append({"action": result.action, "product_id": result.product_id,
-                              "confidence": result.confidence, "reasoning": result.reasoning})
+        try:
+            result = match({
+                "reference_name": li.reference_name or li.designation_raw,
+                "family_id": family_id_by_name_lower.get((li.family_hint or "").lower()),
+                "subcategory": li.subcategory,
+                "packaging": li.packaging,
+                "unit_type": li.unit_type_normalized,
+                "brand": li.brand,
+                "material": li.material,
+                "attributes": li.attributes or {},
+            })
+            match_results.append({"action": result.action, "product_id": result.product_id,
+                                  "confidence": result.confidence, "reasoning": result.reasoning})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Matching failed on a line of %s: %s", name, exc)
+            match_results.append({"action": "new", "product_id": None, "confidence": 0.0,
+                                  "reasoning": f"Matching indisponible ({type(exc).__name__})"})
 
     lines_state: list[dict] = []
     for li, mr in zip(extracted.line_items, match_results):
@@ -538,44 +560,104 @@ if S["ing_step"] == "upload":
                 else f"Analyser les {n_files} factures"
             )
             if st.button(btn_label, type="primary", use_container_width=True):
-                labor_norms = fetch_all("SELECT task_name FROM labor_norms ORDER BY task_name")
-                families = fetch_all("SELECT id, name FROM product_families ORDER BY name")
-                family_id_by_name_lower = {f["name"].lower(): f["id"] for f in families}
+                # On N'ANALYSE PAS ici. Enchaîner N appels Gemini dans UNE seule
+                # exécution de script rend le traitement fragile : Streamlit
+                # interrompt un run long dès que le navigateur se resynchronise,
+                # et la boucle meurt en silence au prochain appel st.* (bug
+                # constaté : « ça démarre à 1/2 puis plus rien »). On se contente
+                # d'enfiler les fichiers ; l'étape « analyzing » ci-dessous en
+                # traite UN PAR EXÉCUTION, donc chaque run reste court.
+                S["ing_analyze_queue"] = [
+                    {"name": _n, "raw": _b} for _n, _b in batch_files
+                ]
+                S["ing_analyze_done"] = []
+                S["ing_analyze_failed"] = []
+                S["ing_analyze_total"] = n_files
+                S["ing_step"] = "analyzing"
+                st.rerun()
 
-                batch: list[dict] = []
-                prog = st.progress(0.0, text="Analyse en cours…")
-                for _i, (_name, _raw) in enumerate(batch_files):
-                    prog.progress(
-                        _i / n_files,
-                        text=f"Analyse {_i + 1}/{n_files} · {_name}",
-                    )
-                    item = _extract_one(
-                        _name, _raw,
-                        labor_norms=labor_norms, families=families,
-                        family_id_by_name_lower=family_id_by_name_lower,
-                    )
-                    if item:
-                        batch.append(item)
-                    # Small pause between Gemini calls to stay clear of quotas.
-                    if _i < n_files - 1:
-                        time.sleep(1.5)
-                prog.progress(1.0, text="Analyse terminée.")
 
-                if not batch:
-                    st.error(
-                        "Aucune facture n'a pu être analysée. Les échecs sont tracés "
-                        "dans la file d'attente (page À classifier)."
-                    )
-                else:
-                    if len(batch) < n_files:
-                        st.warning(
-                            f"{n_files - len(batch)} facture(s) en échec — les "
-                            f"{len(batch)} autres passent en relecture."
-                        )
-                    S["ing_batch"] = batch
-                    _load_batch_item(0)
-                    S["ing_step"] = "review"
-                    st.rerun()
+# ============================================================================
+#  Step B2 — Analyse incrémentale : UN PDF par exécution du script
+# ============================================================================
+# Chaque run traite un seul fichier puis se relance. Un run court ne peut pas
+# être tué par une resynchronisation du navigateur, et l'utilisateur voit la
+# progression avancer réellement entre chaque facture.
+if S["ing_step"] == "analyzing":
+    render_header(title="Ingestion facture", subtitle="étape 2 / 4 · analyse")
+    hf_stepper(["Dépôt", "Extraction", "Relecture", "Valider"], current_idx=1)
+
+    queue = S.get("ing_analyze_queue") or []
+    done = S.get("ing_analyze_done") or []
+    failed = S.get("ing_analyze_failed") or []
+    total = int(S.get("ing_analyze_total") or (len(queue) + len(done) + len(failed)))
+    position = len(done) + len(failed)
+
+    if queue:
+        current = queue[0]
+        st.progress(
+            position / max(total, 1),
+            text=f"Analyse {position + 1}/{total} · {current['name']}",
+        )
+        for _d in done:
+            st.markdown(
+                f'<div class="hf-muted" style="font-size:11.5px">✓ {_d["name"]} — '
+                f'{len(_d["extracted"].get("line_items") or [])} ligne(s)</div>',
+                unsafe_allow_html=True,
+            )
+        for _f in failed:
+            st.markdown(
+                f'<div class="hf-muted" style="font-size:11.5px">✗ {_f} — échec (tracé en file d\'attente)</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.caption(
+            "L'analyse d'une facture prend 10 à 60 s. Si l'écran semble figé plus "
+            "d'une minute, recharge la page : l'analyse reprend automatiquement à "
+            "la facture en cours, celles déjà analysées sont conservées."
+        )
+
+        labor_norms = fetch_all("SELECT task_name FROM labor_norms ORDER BY task_name")
+        families = fetch_all("SELECT id, name FROM product_families ORDER BY name")
+        family_id_by_name_lower = {f["name"].lower(): f["id"] for f in families}
+
+        item = _extract_one(
+            current["name"], current["raw"],
+            labor_norms=labor_norms, families=families,
+            family_id_by_name_lower=family_id_by_name_lower,
+        )
+        if item:
+            done.append(item)
+        else:
+            failed.append(current["name"])
+        S["ing_analyze_done"] = done
+        S["ing_analyze_failed"] = failed
+        S["ing_analyze_queue"] = queue[1:]
+        st.rerun()
+
+    # File vide → bilan puis relecture.
+    S.pop("ing_analyze_queue", None)
+    S.pop("ing_analyze_total", None)
+    S.pop("ing_analyze_failed", None)
+    S.pop("ing_analyze_done", None)
+    if not done:
+        st.error(
+            "Aucune facture n'a pu être analysée. Les échecs sont tracés dans la "
+            "file d'attente (page **À classifier**)."
+        )
+        if st.button("↺ recommencer", type="primary"):
+            _reset()
+            st.rerun()
+        st.stop()
+    if failed:
+        S["ing_flash"] = (
+            f"{len(failed)} facture(s) en échec ({', '.join(failed)}) — "
+            f"les {len(done)} autres passent en relecture."
+        )
+    S["ing_batch"] = done
+    _load_batch_item(0)
+    S["ing_step"] = "review"
+    st.rerun()
 
 
 # ============================================================================
