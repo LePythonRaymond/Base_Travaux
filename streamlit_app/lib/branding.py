@@ -458,6 +458,32 @@ code, pre { font-family: 'JetBrains Mono', monospace !important; font-size: 11.5
     background: var(--hf-paper) !important;
     border: 1px solid var(--hf-border) !important;
 }
+/* Alignment normalisation. The rules above border DIFFERENT nesting levels
+   depending on the widget (text = RootElement, select/textarea = the inner
+   `> div`), so the visible rectangles ended up inset by a pixel or two
+   relative to each other and to their labels — visible as ragged column
+   edges in a 4-up form row. Force every bordered control to span the full
+   column width with border-box sizing, and flush the labels left. */
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stTextInputRootElement"],
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="input"],
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="input"] > div,
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="select"],
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="select"] > div,
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="textarea"],
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="textarea"] > div,
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stNumberInputContainer"] {
+    width: 100% !important;
+    box-sizing: border-box !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+}
+/* Labels flush with the left edge of their own control. */
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stWidgetLabel"],
+[data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stWidgetLabel"] > * {
+    padding-left: 0 !important;
+    margin-left: 0 !important;
+}
+
 /* Focus: green border + soft ring, same as the base (out-of-card) inputs */
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-testid="stTextInputRootElement"]:focus-within,
 [data-testid="stVerticalBlockBorderWrapper"]:not(.st-emotion-cache-0) [data-baseweb="input"]:focus-within > div,

@@ -444,6 +444,22 @@ def _stash_current_batch_item() -> None:
             pass
 
 
+def _show_flash() -> None:
+    """Confirmation d'un enregistrement effectué au run précédent.
+
+    (`_reset()` / `_load_batch_item()` + `st.rerun()` repartent sur un écran
+    propre : le message doit survivre au reset et être rendu ici.)"""
+    msg = S.pop("ing_flash", None)
+    if not msg:
+        return
+    st.success(msg)
+    if S.pop("ing_flash_balloons", False):
+        st.balloons()
+
+
+_show_flash()
+
+
 # ============================================================================
 #  Step A & B — Upload + Extract (batch-aware: analyse all, review one by one)
 # ============================================================================
@@ -1377,22 +1393,25 @@ if S["ing_step"] == "review":
             _next = next((k for k, _it in enumerate(_batch_all) if not _it.get("done")), None)
             if _next is not None:
                 # Enchaîne sur la facture suivante du lot : même écran, même tampon.
-                st.success(
+                S["ing_flash"] = (
                     f"✓ {created} produit(s) créé(s), {updated} mis à jour, "
-                    f"{rejected} rejetée(s) — passage à la facture {_next + 1}/{len(_batch_all)}."
+                    f"{rejected} rejetée(s) — facture suivante ({_next + 1}/{len(_batch_all)})."
                 )
                 _load_batch_item(_next)
                 S["ing_step"] = "review"
-                time.sleep(1.0)
                 st.rerun()
             else:
-                st.success(
+                # Flash + rerun : sans rerun, _reset() vidait l'état APRÈS le
+                # rendu de l'écran de relecture — il fallait recliquer pour que
+                # la page se rafraîchisse.
+                S["ing_flash"] = (
                     f"✓ {created} produit(s) créé(s), {updated} mis à jour, {rejected} ligne(s) rejetée(s). "
                     + ("Lot terminé — toutes les factures ont été validées. " if _batch_all else "")
                     + "→ Voir la page **Produits**."
                 )
+                S["ing_flash_balloons"] = True
                 _reset()
-                st.balloons()
+                st.rerun()
         except Exception as exc:
             log.exception("Commit failed")
             st.error(f"Échec du commit : {exc}")

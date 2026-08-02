@@ -89,6 +89,21 @@ def _reset() -> None:
         S.pop(k, None)
 
 
+def _show_flash() -> None:
+    """Confirmation d'un enregistrement effectué au run précédent.
+
+    (`_reset()` + `st.rerun()` repartent sur un écran propre : le message doit
+    donc survivre au reset et être rendu ici, sinon il serait perdu.)"""
+    msg = S.pop("dpgf_flash", None)
+    if not msg:
+        return
+    st.success(msg)
+    info = S.pop("dpgf_flash_info", None)
+    if info:
+        st.info(info)
+    st.balloons()
+
+
 # ============================================================================
 #  Lookups + clarification helpers (Phase 4)
 # ============================================================================
@@ -246,6 +261,9 @@ with hdr_l:
     render_header(title="Retour DPGF", subtitle=sub, breadcrumb=breadcrumb)
 with hdr_r:
     hf_stepper(["Dépôt", "Matching", "Valider"], current_idx=S["dpgf_step"])
+
+# Confirmation de l'enregistrement précédent (voir _show_flash).
+_show_flash()
 
 
 # ============================================================================
@@ -1311,14 +1329,19 @@ elif S["dpgf_step"] == 2:
                     f"{n_validated} prix de vente historisé(s). "
                     f"Le fichier .xlsx et la rentabilité sont conservés (en bas de cette page)."
                 )
-                st.success(msg)
+                # Flash + rerun : sans le rerun, _reset() vide l'état APRÈS que
+                # l'écran de l'étape 3 a déjà été rendu — l'utilisateur devait
+                # recliquer pour que la page se rafraîchisse. On mémorise le
+                # message, on réinitialise, et on re-rend immédiatement : la
+                # confirmation s'affiche sur l'écran d'accueil propre.
+                S["dpgf_flash"] = msg
                 if n_cost_skipped:
-                    st.info(
+                    S["dpgf_flash_info"] = (
                         f"ℹ️ {n_cost_skipped} ligne(s) sans coût fournisseur (col. AQ vide) : "
                         "le coût du produit n'a pas été modifié — seul le prix de vente a été historisé."
                     )
                 _reset()
-                st.balloons()
+                st.rerun()
             except Exception as exc:
                 st.error(f"Échec de l'enregistrement : {exc}")
 
